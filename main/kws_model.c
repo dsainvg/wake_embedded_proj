@@ -682,14 +682,7 @@ float kws_model_run(const float *spec)
     for (int t = 0; t < KWS_FRAMES; t++) {
         build_feat(spec, t);
 #if defined(KWS_HOST_TEST) && defined(KWS_CAPTURE_ON)
-        /* stage 20: s_feat at the exact call site, no accumulation in between */
-        if (t == 0) {
-            KWS_CAPTURE(20, s_feat, 360);
-            KWS_CAPTURE(22, spec, 8);   /* what spec[0..7] holds right here */
-            KWS_CAPTURE(23, (const float *)(const void *)&spec, 2);  /* the pointer itself */
-        }
-        /* stage 21: s_feat again, immediately after the memcpy */
-        KWS_CAPTURE(21, s_feat, 360);
+        memcpy(&s_delta_dbg[(size_t)t * 360], s_feat, sizeof(s_feat));
 #endif
         conv1_row(s_row);
 #if defined(KWS_HOST_TEST) && defined(KWS_CAPTURE_ON)
