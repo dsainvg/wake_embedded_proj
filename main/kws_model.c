@@ -79,6 +79,8 @@ static float s_feat[3][KWS_MELS * 3];   /* delta-stack rows t-1, t, t+1 */
 static float s_row[ROW_H];               /* stem row    20 x 32 */
 static float s_frow[ROW_H];              /* f_conv row  20 x 32 */
 EXT_RAM_BSS_ATTR static float s_hring[3][ROW_H];
+/* SAME padding over time: the rows just outside the window are zeros. */
+static float s_hrow_zero[ROW_H];
 
 EXT_RAM_BSS_ATTR static float s_c2[C2_N];                /* conv2 output, 94 KB - the big one */
 EXT_RAM_BSS_ATTR static float s_seq[SEQ_N];
@@ -650,8 +652,27 @@ static void soft_or_pool(const float *x, float *out)
 
 void kws_model_init(void)
 {
+    /* Zero every activation buffer, not just the ones a previous call was
+     * thought to have written. Reading a buffer that some early-exit path never
+     * touched makes the result depend on whatever was in that RAM, which
+     * presented as a model that returned a different probability on every
+     * call. Clearing everything makes the run deterministic, which is also
+     * what makes it debuggable. */
+    memset(s_feat, 0, sizeof(s_feat));
+    memset(s_row, 0, sizeof(s_row));
+    memset(s_frow, 0, sizeof(s_frow));
+    memset(s_hring, 0, sizeof(s_hring));
+    memset(s_hrow_zero, 0, sizeof(s_hrow_zero));
     memset(s_c2, 0, sizeof(s_c2));
     memset(s_seq, 0, sizeof(s_seq));
+    memset(s_ln, 0, sizeof(s_ln));
+    memset(s_qkv, 0, sizeof(s_qkv));
+    memset(s_attn, 0, sizeof(s_attn));
+    memset(s_blk, 0, sizeof(s_blk));
+    memset(s_ffn, 0, sizeof(s_ffn));
+    memset(s_logits, 0, sizeof(s_logits));
+    memset(s_pool_s, 0, sizeof(s_pool_s));
+    gn_reset();
 }
 
 float kws_model_run(const float *spec)
@@ -712,12 +733,34 @@ float kws_model_run(const float *spec)
 
         memcpy(s_hring[t % 3], s_frow, sizeof(s_frow));
 
+        /*
+         * conv2's output row o consumes stem rows o-1, o, o+1. After storing
+         * frame t the complete outputs are o = t-1 (needing t-2, t-1, t).
+         *
+         * Two edges need care and both were wrong before:
+         *
+         *  - o = 0 needs stem row -1, which SAME padding supplies as ZEROS.
+         *    Reading a never-written ring slot here is what made the model
+         *    return a different probability on every call.
+         *  - o = 48 needs stem row 49, also zeros, and can only be completed
+         *    after the loop. Skipping it left the last output row uninitialised
+         *    for the whole network downstream.
+         */
         if (t >= 1) {
-            conv2_row(s_hring[(t + 2) % 3], s_hring[t % 3], s_hring[(t + 1) % 3],
+            const float *r0 = (t >= 2) ? s_hring[(t + 1) % 3] : s_hrow_zero;
+            const float *r1 = s_hring[(t + 2) % 3];      /* t-1 */
+            const float *r2 = s_hring[t % 3];            /* t   */
+            conv2_row(r0, r1, r2,
                       s_c2 + (size_t)(t - 1) * KWS_STEM_MELS * KWS_C2_OUT);
         }
     }
 
+    /* Final output row: stem rows 47, 48 and a zero-padded 49. The ring still
+     * holds those two because 47 % 3 == 2 and 48 % 3 == 0. */
+    conv2_row(s_hring[(KWS_FRAMES - 2) % 3],
+              s_hring[(KWS_FRAMES - 1) % 3],
+              s_hrow_zero,
+              s_c2 + (size_t)(KWS_FRAMES - 1) * KWS_STEM_MELS * KWS_C2_OUT);
 
     /* --- GroupNorm-3 + swish over conv2 output, in place ---------------- */
     gn_reset();

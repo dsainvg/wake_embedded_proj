@@ -110,6 +110,38 @@ int main(void)
 
     dump("main/model/reference/feat_spec_after.bin", spec, (size_t)rows * cols);
 
+    /* Does a full kws_model_run call change anything the isolated path
+     * depends on? Conv1 for t=0 is measured before and after the call. */
+    {
+        static float pre[640], post[640];
+        kws_model_init();
+        kws_debug_conv1(spec, 0, pre);
+        const float p1 = kws_model_run(spec);
+        kws_debug_conv1(spec, 0, post);
+        const float p2 = kws_model_run(spec);
+
+        double d = 0.0;
+        for (int i = 0; i < 640; i++) {
+            const double e = (double)pre[i] - (double)post[i];
+            d += e * e;
+        }
+        printf("STATE CHECK\n");
+        printf("  conv1(t=0) before/after a model call : rms diff %.4e\n",
+               sqrt(d / 640.0));
+        printf("  P, first call  = %.8f\n", (double)p1);
+        printf("  P, second call = %.8f\n", (double)p2);
+
+        /* Is the residual variation leftover state, or something else? */
+        for (int i = 0; i < 3; i++) {
+            kws_model_init();
+            printf("  fresh init, call %d = %.8f\n", i, (double)kws_model_run(spec));
+        }
+        for (int i = 0; i < 3; i++) {
+            printf("  no re-init,   call %d = %.8f\n", i, (double)kws_model_run(spec));
+        }
+        dump("main/model/reference/feat_conv1_post.bin", post, 640);
+    }
+
     /* The decisive test: run the WHOLE network here, where no capture
      * machinery is compiled in. If this matches the JAX reference then the
      * stage comparison was perturbing what it measured, not the model. */
