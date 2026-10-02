@@ -25,6 +25,7 @@
 
 #include "kws_frontend.h"
 
+#include <esp_attr.h>
 #include <math.h>
 #include <string.h>
 
@@ -102,8 +103,8 @@ static void fft256(float *re, float *im)
     }
 }
 
-static float s_pre[M];
-static float s_pim[M];
+EXT_RAM_BSS_ATTR static float s_pre[M];
+EXT_RAM_BSS_ATTR static float s_pim[M];
 
 /*
  * Real 512-point FFT of a real signal -> |X[k]|^2 for k = 0..256 (257 bins).
@@ -155,12 +156,12 @@ static void real_fft512(const float *x, float *power)
 /* Front end state                                                    */
 /* ------------------------------------------------------------------ */
 
-static float s_mel_frames[KWS_FRAMES][KWS_MELS];
-static float s_frame[KWS_NFFT];
-static float s_power[KWS_NFFT / 2 + 1];
+EXT_RAM_BSS_ATTR static float s_mel_frames[KWS_FRAMES][KWS_MELS];
+EXT_RAM_BSS_ATTR static float s_frame[KWS_NFFT];
+EXT_RAM_BSS_ATTR static float s_power[KWS_NFFT / 2 + 1];
 
 /* Sliding window: KWS_AUDIO_SAMPLES retained, KWS_MAX_HOP of append room. */
-static int16_t s_audio[KWS_AUDIO_SAMPLES + KWS_MAX_HOP];
+EXT_RAM_BSS_ATTR static int16_t s_audio[KWS_AUDIO_SAMPLES + KWS_MAX_HOP];
 static int      s_filled = 0;       /* valid samples in s_audio            */
 static int      s_pending = 0;      /* pushed since the last compute       */
 static bool     s_primed = false;

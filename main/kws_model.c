@@ -36,6 +36,7 @@
 #include "kws_model.h"
 #include "kws_model_data.h"
 
+#include <esp_attr.h>
 #include <math.h>
 #include <string.h>
 
@@ -67,16 +68,16 @@ const float *kws_blob = kws_weights;
 static float s_feat[3][KWS_MELS * 3];   /* delta-stack rows t-1, t, t+1 */
 static float s_row[ROW_H];               /* stem row    20 x 32 */
 static float s_frow[ROW_H];              /* f_conv row  20 x 32 */
-static float s_hring[3][ROW_H];
+EXT_RAM_BSS_ATTR static float s_hring[3][ROW_H];
 
-static float s_c2[C2_N];                /* conv2 output, 94 KB - the big one */
-static float s_seq[SEQ_N];
+EXT_RAM_BSS_ATTR static float s_c2[C2_N];                /* conv2 output, 94 KB - the big one */
+EXT_RAM_BSS_ATTR static float s_seq[SEQ_N];
 
-static float s_ln[SEQ_N];
-static float s_qkv[(size_t)KWS_FRAMES * 3 * KWS_DIM];
-static float s_attn[SEQ_N];
-static float s_blk[SEQ_N];
-static float s_ffn[FFN_N];
+EXT_RAM_BSS_ATTR static float s_ln[SEQ_N];
+EXT_RAM_BSS_ATTR static float s_qkv[(size_t)KWS_FRAMES * 3 * KWS_DIM];
+EXT_RAM_BSS_ATTR static float s_attn[SEQ_N];
+EXT_RAM_BSS_ATTR static float s_blk[SEQ_N];
+EXT_RAM_BSS_ATTR static float s_ffn[FFN_N];
 static float s_logits[KWS_FRAMES];
 static float s_pool_s[KWS_FRAMES];
 
