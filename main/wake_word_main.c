@@ -31,16 +31,13 @@
 #include "driver/i2s_std.h"
 #include "nvs_flash.h"
 
+#include "kws_frontend.h"
+#include "kws_model.h"
+
 #if CONFIG_EXAMPLE_LED_TYPE_WS2812
 #include "led_strip.h"
 #endif
 
-#include "esp_afe_config.h"
-#include "esp_afe_sr_iface.h"
-#include "esp_afe_sr_models.h"
-#include "esp_wn_iface.h"
-#include "esp_wn_models.h"
-#include "model_path.h"
 
 static const char *TAG = "wake";
 
@@ -56,8 +53,6 @@ static const char *TAG = "wake";
 /* Globals                                                            */
 /* ------------------------------------------------------------------ */
 
-static const esp_afe_sr_iface_t *s_afe_handle = NULL;
-static esp_afe_sr_data_t *s_afe_data = NULL;
 
 static i2s_chan_handle_t s_rx_chan = NULL;
 
@@ -491,98 +486,116 @@ static void i2s_init(void)
              CONFIG_EXAMPLE_I2S_SD_GPIO, SAMPLE_RATE);
 }
 
-static void feed_task(void *arg)
+static void kws_task(void *arg)
 {
-    const int chunk = s_afe_handle->get_feed_chunksize(s_afe_data);
-    const int nch  = s_afe_handle->get_feed_channel_num(s_afe_data);
-    const size_t n_samples = (size_t)chunk * nch;
+    /* The window walks in hop-sized steps. KWS_MAX_HOP bounds it, and the front
+     * end only reuses feature frames when the hop is a whole number of feature
+     * hops (320 samples), so the hop must be a multiple of 320. */
+    const int hop = CONFIG_EXAMPLE_HOP_MS * SAMPLE_RATE / 1000;
 
-    ESP_LOGI(TAG, "AFE feed: %d samples/frame, %d channel(s)", chunk, nch);
+    if (hop <= 0 || hop > KWS_MAX_HOP || (hop % KWS_HOP) != 0) {
+        ESP_LOGE(TAG, "hop of %d samples is not a multiple of %d (<= %d)",
+                 hop, KWS_HOP, KWS_MAX_HOP);
+        vTaskDelete(NULL);
+        return;
+    }
 
-    int32_t *raw = heap_caps_malloc(n_samples * sizeof(int32_t), MALLOC_CAP_DMA);
-    int16_t *pcm = heap_caps_malloc(n_samples * sizeof(int16_t), MALLOC_CAP_INTERNAL);
+    /* i2s_channel_read() destination must be DMA capable. */
+    int16_t *raw = heap_caps_malloc(hop * sizeof(int16_t), MALLOC_CAP_DMA);
+    static float spec[KWS_FRAMES * KWS_MELS];
     ESP_ERROR_CHECK(raw ? ESP_OK : ESP_ERR_NO_MEM);
-    ESP_ERROR_CHECK(pcm ? ESP_OK : ESP_ERR_NO_MEM);
+
+    ESP_LOGI(TAG, "sliding window: %d ms hop (%d samples), refractory %d ms",
+             CONFIG_EXAMPLE_HOP_MS, hop, CONFIG_EXAMPLE_REFRACTORY_MS);
+
+    int refractory_steps = CONFIG_EXAMPLE_REFRACTORY_MS / CONFIG_EXAMPLE_HOP_MS;
+    if (refractory_steps < 1) {
+        refractory_steps = 1;
+    }
+
+    float hold = 0.0f;
+    int hits = 0;
+    int lockout = 0;
+
+    int64_t next_stat = esp_timer_get_time();
+    int64_t ema_us = 0;
+    int32_t ema_inf_ms = 0;
 
     for (;;) {
         size_t got = 0;
-        while (got < n_samples * sizeof(int32_t)) {
-            size_t bytes_read = 0;
+        while (got < (size_t)hop * sizeof(int16_t)) {
+            size_t n = 0;
             esp_err_t err = i2s_channel_read(s_rx_chan, (uint8_t *)raw + got,
-                                             n_samples * sizeof(int32_t) - got,
-                                             &bytes_read, portMAX_DELAY);
+                                             (size_t)hop * sizeof(int16_t) - got,
+                                             &n, portMAX_DELAY);
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "i2s read: %s", esp_err_to_name(err));
                 vTaskDelay(pdMS_TO_TICKS(10));
                 break;
             }
-            got += bytes_read;
+            got += n;
         }
 
-        /* INMP441 24-bit payload sits in bits 31..8 of the 32-bit slot. */
-        for (size_t i = 0; i < n_samples; i++) {
-            pcm[i] = (int16_t)(raw[i] >> CONFIG_EXAMPLE_MIC_SAMPLE_SHIFT);
+        kws_frontend_push(raw, hop);
+        if (!kws_frontend_compute(spec)) {
+            continue;               /* still filling the first window */
         }
 
-        ring_push(pcm, n_samples);
-        capture_push(pcm, n_samples);
-        s_afe_handle->feed(s_afe_data, pcm);
-    }
-}
+        const int64_t t0 = esp_timer_get_time();
+        const float prob = kws_model_run(spec);
+        const int64_t dt = esp_timer_get_time() - t0;
 
-/* ------------------------------------------------------------------ */
-/* AFE fetch: detection, LED, capture trigger                         */
-/* ------------------------------------------------------------------ */
+        /* Exponential average of inference time, so the reading is stable. */
+        ema_us = (ema_us == 0) ? dt : (ema_us * 7 + dt) / 8;
+        ema_inf_ms = (int32_t)(ema_us / 1000);
 
-static void detect_task(void *arg)
-{
-    int64_t last_hit = 0;
-    int64_t next_stat = esp_timer_get_time();
-    float peak_dbfs = -100.0f;
+        /* Peak-hold confirmation, exactly as models/kws_engine.py does it. An
+         * EMA at alpha 0.6 cannot confirm a realistic burst: two frames at
+         * p=0.90 lift it only to 0.71, which never clears the 0.68 operating
+         * point after a dip. The hold confirms on a genuine 0.5 s keyword. */
+        hold = (prob > hold * CONFIG_EXAMPLE_HOLD_DECAY)
+                   ? prob : hold * CONFIG_EXAMPLE_HOLD_DECAY;
 
-    for (;;) {
-        afe_fetch_result_t *res = s_afe_handle->fetch(s_afe_data);
-        if (res == NULL || res->ret_value == ESP_FAIL) {
-            continue;
+        if (lockout > 0) {
+            lockout--;
         }
 
-        if (res->data_volume > peak_dbfs) {
-            peak_dbfs = res->data_volume;
+        bool detected = false;
+        if (hold >= CONFIG_EXAMPLE_THRESHOLD) {
+            if (++hits >= CONFIG_EXAMPLE_NEED) {
+                if (lockout == 0) {
+                    detected = true;
+                    hits = 0;
+                    hold = 0.0f;
+                    lockout = refractory_steps;
+                }
+            }
+        } else {
+            hits = 0;
         }
 
-        int64_t now = esp_timer_get_time();
-
-        if (res->wakeup_state == WAKENET_DETECTED &&
-            now - last_hit >= (int64_t)CONFIG_EXAMPLE_DETECT_COOLDOWN_MS * 1000) {
-            last_hit = now;
-
-            ESP_LOGW(TAG, "WAKE WORD DETECTED (model %d, word %d, %.1f dBFS)",
-                     res->wakenet_model_index, res->wake_word_index,
-                     (double)res->data_volume);
-
-            /* Green acknowledgement for 3 s. */
+        if (detected) {
+            ESP_LOGW(TAG, "WAKE WORD 'amaze'  p=%.3f  (%d ms inference)",
+                     (double)prob, ema_inf_ms);
             s_led_state = LED_DETECTED;
-            s_led_until = now + 3000000;
-
+            s_led_until = esp_timer_get_time() + 3000000;
 #if CONFIG_EXAMPLE_STORAGE_ENABLED
-            /* Open the window on the audio that follows the keyword. */
             capture_start();
 #endif
         }
 
+        const int64_t now = esp_timer_get_time();
         if (now >= next_stat) {
-            ESP_LOGI(TAG, "listening: vad=%d peak=%.1f dBFS heap=%u",
-                     res->vad_state, (double)peak_dbfs,
+            ESP_LOGI(TAG, "listening  p=%.3f hold=%.3f  infer=%d ms  hop=%d ms  "
+                          "duty=%.1f%%  heap=%u",
+                     (double)prob, (double)hold, ema_inf_ms,
+                     CONFIG_EXAMPLE_HOP_MS,
+                     100.0f * (float)ema_inf_ms / (float)CONFIG_EXAMPLE_HOP_MS,
                      (unsigned)esp_get_free_heap_size());
-            peak_dbfs = -100.0f;
             next_stat = now + 5000000;
         }
     }
 }
-
-/* ------------------------------------------------------------------ */
-/* app_main                                                           */
-/* ------------------------------------------------------------------ */
 
 void app_main(void)
 {
@@ -610,46 +623,25 @@ void app_main(void)
     s_write_req = xSemaphoreCreateBinary();
     ESP_ERROR_CHECK(s_capture_lock ? ESP_OK : ESP_ERR_NO_MEM);
     ESP_ERROR_CHECK(s_write_req ? ESP_OK : ESP_ERR_NO_MEM);
+    ESP_LOGI(TAG, "keeping a rolling %d s capture in PSRAM", CONFIG_EXAMPLE_CLIP_SECONDS);
 #endif
 
-    srmodel_list_t *models = esp_srmodel_init("model");
-    ESP_ERROR_CHECK(models ? ESP_OK : ESP_ERR_NOT_FOUND);
+    kws_frontend_init();
+    kws_model_init();
 
-    for (int i = 0; i < models->num; i++) {
-        if (strstr(models->model_name[i], ESP_WN_PREFIX) != NULL) {
-            ESP_LOGI(TAG, "wake word model: %s (%s)",
-                     models->model_name[i], models->model_info[i]);
-        }
-    }
-    if (esp_srmodel_filter(models, ESP_WN_PREFIX, NULL) == NULL) {
-        ESP_LOGE(TAG, "no WakeNet model flashed - pick one under "
-                      "menuconfig > ESP Speech Recognition");
-    }
-
-    afe_config_t *cfg = afe_config_init("M", models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
-    ESP_ERROR_CHECK(cfg ? ESP_OK : ESP_ERR_NO_MEM);
-
-    if (cfg->wakenet_model_name) {
-        ESP_LOGI(TAG, "AFE wake word: %s", cfg->wakenet_model_name);
-    }
-
-    s_afe_handle = esp_afe_handle_from_config(cfg);
-    ESP_ERROR_CHECK(s_afe_handle ? ESP_OK : ESP_ERR_NO_MEM);
-    s_afe_data = s_afe_handle->create_from_config(cfg);
-    ESP_ERROR_CHECK(s_afe_data ? ESP_OK : ESP_ERR_NO_MEM);
-    afe_config_free(cfg);
-
-    s_afe_handle->set_wakenet_threshold(s_afe_data, 1,
-                                        CONFIG_EXAMPLE_WAKENET_THRESHOLD);
+    ESP_LOGI(TAG, "Amaze v11 bcconformer_v3, %u params, threshold %.2f, "
+                  "%d-of-%d peak-hold, decay %.2f",
+             KWS_PARAM_COUNT, (double)CONFIG_EXAMPLE_THRESHOLD,
+             CONFIG_EXAMPLE_NEED, CONFIG_EXAMPLE_NEED,
+             (double)CONFIG_EXAMPLE_HOLD_DECAY);
 
     i2s_init();
 
-    xTaskCreatePinnedToCore(led_task,    "led",    3072, NULL, 3, NULL, 0);
+    xTaskCreatePinnedToCore(led_task,     "led",   3072, NULL, 3, NULL, 0);
 #if CONFIG_EXAMPLE_STORAGE_ENABLED
     xTaskCreatePinnedToCore(storage_task, "store", 4096, NULL, 2, NULL, 1);
 #endif
-    xTaskCreatePinnedToCore(feed_task,   "feed",   8192, NULL, 6, NULL, 0);
-    xTaskCreatePinnedToCore(detect_task, "detect", 4096, NULL, 5, NULL, 1);
+    xTaskCreatePinnedToCore(kws_task,     "kws",   8192, NULL, 6, NULL, 0);
 
-    ESP_LOGI(TAG, "running - say your wake word; LED turns green for 3 s on a hit");
+    ESP_LOGI(TAG, "running - say 'amaze'; LED turns green for 3 s on a hit");
 }

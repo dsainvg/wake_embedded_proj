@@ -39,13 +39,48 @@ endmenu
 
 menu "Wake Word Detection"
 
-    config EXAMPLE_WAKENET_THRESHOLD
-        float "WakeNet detection threshold (0.0 - 1.0)"
+    config EXAMPLE_THRESHOLD
+        float "Detection threshold"
         range 0.0 1.0
-        default 0.5
+        default 0.68
         help
-            Higher means stricter / fewer false triggers. Start at the default and
-            raise it if the LED triggers on background noise.
+            Frozen operating point read from models/best_v11_production.flax
+            (deploy_threshold). Raising it trades recall for fewer false
+            activations; lowering it does the reverse.
+
+    config EXAMPLE_NEED
+        int "Consecutive hits required to confirm"
+        default 2
+        help
+            deploy_need from the checkpoint. 2-of-2 beats 1-of-2 on false
+            alarms; 1-of-2 gains 16-20 points of recall at low SNR but 16 FA/h.
+
+    config EXAMPLE_HOLD_DECAY
+        float "Peak-hold decay per window"
+        range 0.0 1.0
+        default 0.85
+        help
+            hold = max(p, hold * decay). Replaces the EMA the reference engine
+            used before v6; an EMA cannot confirm a short keyword burst.
+
+    config EXAMPLE_REFRACTORY_MS
+        int "Refractory period after a detection (ms)"
+        default 1500
+        help
+            Ignore further hits for this long. Derived from
+            deploy_refractory_steps at the model's 100 ms stride.
+
+    config EXAMPLE_HOP_MS
+        int "Inference hop (ms)"
+        default 200
+        help
+            How far the 1 s window advances per inference. This is the main CPU
+            dial: duty cycle is roughly inference_time / hop.
+
+            200 ms costs about 9.4% CPU with INT8 weights, about 28% in float32.
+            Must be a multiple of 20 ms, because the front end only reuses
+            feature frames when the hop is a whole number of feature hops
+            (320 samples).
 
     choice EXAMPLE_LED_TYPE
         prompt "Status LED type"
@@ -78,12 +113,6 @@ menu "Wake Word Detection"
         default n
         help
             Enable if the LED anode is tied to 3V3.
-
-    config EXAMPLE_DETECT_COOLDOWN_MS
-        int "Cooldown between detections (ms)"
-        default 2000
-        help
-            Ignore further wake word hits for this long after one is accepted.
 
 endmenu
 
