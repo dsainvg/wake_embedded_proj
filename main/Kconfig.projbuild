@@ -1,0 +1,121 @@
+menu "INMP441 Microphone"
+
+    config EXAMPLE_I2S_WS_GPIO
+        int "I2S WS (LRCL) GPIO"
+        default 40
+        help
+            INMP441 WS pin. Also drives the L/R channel select when tied to VDD/GND.
+
+    config EXAMPLE_I2S_SCK_GPIO
+        int "I2S SCK (BCLK) GPIO"
+        default 41
+        help
+            INMP441 SCK pin.
+
+    config EXAMPLE_I2S_SD_GPIO
+        int "I2S SD (DOUT) GPIO"
+        default 42
+        help
+            INMP441 SD (data out) pin.
+
+    config EXAMPLE_SAMPLE_RATE
+        int "Audio Sample Rate (Hz)"
+        default 16000
+        help
+            ESP-SR WakeNet requires 16000 Hz. Do not change unless you change the model.
+
+    config EXAMPLE_MIC_SAMPLE_SHIFT
+        int "Right-shift applied to 32-bit I2S samples"
+        range 8 24
+        default 16
+        help
+            INMP441 sends 24 bits of two's complement audio left-justified in a
+            32-bit I2S slot, i.e. bits 31..8. To get a full-scale int16 PCM
+            sample you must discard the 8 unused low bits AND the 8 low bits of
+            the real payload: shift right by 16.
+            Use 14 to boost gain by 6 dB (clipping risk), 16 for correct range.
+
+endmenu
+
+menu "Wake Word Detection"
+
+    config EXAMPLE_WAKENET_THRESHOLD
+        float "WakeNet detection threshold (0.0 - 1.0)"
+        range 0.0 1.0
+        default 0.5
+        help
+            Higher means stricter / fewer false triggers. Start at the default and
+            raise it if the LED triggers on background noise.
+
+    choice EXAMPLE_LED_TYPE
+        prompt "Status LED type"
+        default EXAMPLE_LED_TYPE_WS2812
+        help
+            GPIO48 on most ESP32-S3 devkits is an addressable RGB LED (WS2812).
+            A plain GPIO toggle cannot light it - the driver has to send pixel
+            data on the single data line. Pick PLAIN_GPIO only if you wired a
+            discrete LED to the pin yourself.
+
+        config EXAMPLE_LED_TYPE_WS2812
+            bool "Addressable RGB LED (WS2812 / SK6812)"
+
+        config EXAMPLE_LED_TYPE_GPIO
+            bool "Plain GPIO LED"
+    endchoice
+
+    config EXAMPLE_LED_GPIO
+        int "Status LED GPIO"
+        default 48
+
+    config EXAMPLE_LED_LED_COUNT
+        int "Number of addressable LEDs"
+        depends on EXAMPLE_LED_TYPE_WS2812
+        default 1
+
+    config EXAMPLE_LED_ACTIVE_LOW
+        bool "Plain GPIO LED is active low"
+        depends on EXAMPLE_LED_TYPE_GPIO
+        default n
+        help
+            Enable if the LED anode is tied to 3V3.
+
+    config EXAMPLE_DETECT_COOLDOWN_MS
+        int "Cooldown between detections (ms)"
+        default 2000
+        help
+            Ignore further wake word hits for this long after one is accepted.
+
+endmenu
+
+menu "Flash Clip Storage"
+
+    config EXAMPLE_STORAGE_ENABLED
+        bool "Store wake word clips to internal flash"
+        default y
+        help
+            Keep a rolling 10-second PCM buffer in PSRAM and write it to the
+            "storage" partition as a WAV file each time the wake word is detected.
+
+    config EXAMPLE_CLIP_SECONDS
+        int "Clip length to save (seconds)"
+        range 2 30
+        default 10
+        help
+            Total length of each saved WAV, measured from the end of the
+            keyword. At 16 kHz 16-bit mono, 10 s is 320000 bytes.
+
+    config EXAMPLE_PRE_ROLL_SECONDS
+        int "Seconds of keyword tail kept at the front of the clip"
+        range 0 5
+        default 1
+        help
+            On detection the capture window opens with this many seconds of
+            already-buffered audio, so the saved clip contains the tail of the
+            keyword rather than starting cold right after it.
+            0 = strictly the audio following the keyword.
+
+    config EXAMPLE_STORAGE_PARTITION
+        string "Storage partition label"
+        default "storage"
+
+endmenu

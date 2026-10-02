@@ -1,0 +1,14 @@
+# ESP32-S3-N16R8 custom partition table (16 MB flash)
+#
+# Name,     Type, SubType, Offset,   Size,    Flags
+#
+# --- Boot / system ---
+nvs,        data, nvs,     0x9000,   0x5000,
+otadata,    data, ota,     0xe000,   0x2000,
+phy_init,   data, phy,     0x10000,  0x1000,
+# --- Application ---
+factory,    app,  factory, 0x20000,  0x300000,
+# --- ESP-SR neural network models (read-only, loaded by esp-sr) ---
+model,      data, spiffs,  ,         0x200000,
+# --- Rolling 16 kHz WAV clip storage (10 s per slot x 16 slots) ---
+storage,    data, 0x41,    ,         0x800000,
