@@ -91,7 +91,7 @@ EXT_RAM_BSS_ATTR static float s_ffn[FFN_N];
 static float s_logits[KWS_FRAMES];
 static float s_pool_s[KWS_FRAMES];
 
-#ifdef KWS_HOST_TEST
+#if defined(KWS_HOST_TEST) && defined(KWS_CAPTURE_ON)
 /* Validation-only buffers. They are ~316 KB of .bss together, which overflows
  * internal DRAM on its own and would also blow the 256 KB RAM budget, so they
  * must never exist in a firmware build. */
@@ -354,9 +354,18 @@ static void conv1_row(float *out);
 #ifdef KWS_HOST_TEST
 void kws_debug_addrs(const char **names, const void **ptrs, int n)
 {
-    const void *tab[] = { s_feat, s_row, s_frow, s_hring, s_stem_dbg,
-                          s_delta_dbg, s_c2, s_seq, s_ln, s_qkv, s_attn,
-                          s_blk, s_ffn, kws_debug_buf };
+    const void *tab[] = { s_feat, s_row, s_frow, s_hring,
+#if defined(KWS_HOST_TEST) && defined(KWS_CAPTURE_ON)
+                          s_stem_dbg, s_delta_dbg,
+#endif
+                          s_c2, s_seq, s_ln, s_qkv, s_attn,
+                          s_blk, s_ffn,
+#if defined(KWS_HOST_TEST) && defined(KWS_CAPTURE_ON)
+                          kws_debug_buf
+#else
+                          NULL
+#endif
+                          };
     const char *nm[] = { "s_feat", "s_row", "s_frow", "s_hring", "s_stem_dbg",
                          "s_delta_dbg", "s_c2", "s_seq", "s_ln", "s_qkv",
                          "s_attn", "s_blk", "s_ffn", "kws_debug_buf" };
@@ -651,7 +660,7 @@ float kws_model_run(const float *spec)
     gn_reset();
     for (int t = 0; t < KWS_FRAMES; t++) {
         build_feat(spec, t);
-#ifdef KWS_HOST_TEST
+#if defined(KWS_HOST_TEST) && defined(KWS_CAPTURE_ON)
         /* stage 20: s_feat at the exact call site, no accumulation in between */
         if (t == 0) {
             KWS_CAPTURE(20, s_feat, 360);
@@ -662,12 +671,12 @@ float kws_model_run(const float *spec)
         KWS_CAPTURE(21, s_feat, 360);
 #endif
         conv1_row(s_row);
-#ifdef KWS_HOST_TEST
+#if defined(KWS_HOST_TEST) && defined(KWS_CAPTURE_ON)
         memcpy(&s_stem_dbg[(size_t)t * ROW_H], s_row, sizeof(s_row));
 #endif
         gn_accum(s_row, ROW_W, KWS_C1_OUT);
     }
-#ifdef KWS_HOST_TEST
+#if defined(KWS_HOST_TEST) && defined(KWS_CAPTURE_ON)
     KWS_CAPTURE(14, s_delta_dbg, KWS_FRAMES * 360);   /* delta stack */
     KWS_CAPTURE(10, s_stem_dbg, KWS_FRAMES * ROW_H);  /* conv1 output */
 #endif

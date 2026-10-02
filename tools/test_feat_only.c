@@ -110,6 +110,24 @@ int main(void)
 
     dump("main/model/reference/feat_spec_after.bin", spec, (size_t)rows * cols);
 
+    /* The decisive test: run the WHOLE network here, where no capture
+     * machinery is compiled in. If this matches the JAX reference then the
+     * stage comparison was perturbing what it measured, not the model. */
+    {
+        kws_model_init();
+        const float got = kws_model_run(spec);
+        printf("FULL MODEL, capture-free build\n");
+        printf("  C        P(keyword) = %.8f\n", (double)got);
+        float *ref_prob = read_npy("main/model/reference/noise_prob.npy", NULL, NULL);
+        if (ref_prob) {
+            printf("  JAX      P(keyword) = %.8f\n", (double)ref_prob[1]);
+            printf("  abs diff           = %.3e\n",
+                   (double)(got > ref_prob[1] ? got - ref_prob[1] : ref_prob[1] - got));
+            free(ref_prob);
+        }
+        dump("main/model/reference/feat_spec_final.bin", spec, (size_t)rows * cols);
+    }
+
     {
         static float crow[640];
         FILE *cf = fopen("main/model/reference/conv1_rows.bin", "wb");
