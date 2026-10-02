@@ -274,7 +274,7 @@ free(ref_spec);
         const char *sdir = "main/model/reference/stages";
         const char *names[] = {"", "stem", "conv2", "gn3swish", "seq",
                                "block1", "block2", "block3", "feat", "logits"};
-        for (int st = 10; st <= 22; st++) {
+        for (int st = 10; st <= 23; st++) {
             char out[512];
             snprintf(out, sizeof(out), "%s/c_%d_site.bin", sdir, st);
             FILE *o = fopen(out, "wb");
