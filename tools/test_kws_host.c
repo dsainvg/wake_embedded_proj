@@ -196,6 +196,30 @@ snprintf(path, sizeof(path), "%s/%s_prob.npy", ref_dir, tag);
         }
     }
     printf("expected P(keyword) = %.8f\n", expect);
+    printf("ADDR ref_spec=%p  kws_debug_buf=%p  span=%u bytes\n",
+           (void *)ref_spec, (void *)kws_debug_buf,
+           (unsigned)(KWS_DEBUG_MAX * sizeof(float)));
+
+    /* Does kws_model_run write through its const spec pointer? Compare the
+     * caller's buffer before and after, element by element. */
+    {
+        FILE *o = fopen("main/model/reference/c_spec_after.bin", "wb");
+        if (o) {
+            fwrite(ref_spec, sizeof(float), (size_t)rows * cols, o);
+            fclose(o);
+            double worst = 0.0;
+            int worst_i = -1;
+            for (int i = 0; i < rows * cols; i++) {
+                const double d = fabs((double)ref_spec[i]);
+                if (d > worst) { worst = d; worst_i = i; }
+            }
+            printf("spec after inference: max |value| = %.6f at index %d "
+                   "(frame %d mel %d)\n",
+                   worst, worst_i,
+                   (worst_i >= 0 ? worst_i / cols : -1),
+                   (worst_i >= 0 ? worst_i % cols : -1));
+        }
+    }
 
     /* --- run ------------------------------------------------------------ */
     float got = kws_model_run(ref_spec);
@@ -250,15 +274,22 @@ free(ref_spec);
         const char *sdir = "main/model/reference/stages";
         const char *names[] = {"", "stem", "conv2", "gn3swish", "seq",
                                "block1", "block2", "block3", "feat", "logits"};
-        for (int st = 10; st <= 14; st++) {
+        for (int st = 10; st <= 22; st++) {
             char out[512];
-            snprintf(out, sizeof(out), "%s/c_%d_sub.bin", sdir, st);
+            snprintf(out, sizeof(out), "%s/c_%d_site.bin", sdir, st);
             FILE *o = fopen(out, "wb");
             if (!o) break;
-            kws_debug_stage = st;
-            (void)kws_model_run(ref_spec);
-            kws_debug_stage = 0;
-            fwrite(kws_debug_buf, sizeof(float), kws_debug_n, o);
+            {
+                float before0 = ref_spec[0], before1 = ref_spec[1];
+                kws_debug_stage = st;
+                (void)kws_model_run(ref_spec);
+                kws_debug_stage = 0;
+                if (ref_spec[0] != before0 || ref_spec[1] != before1) {
+                    printf("  stage %d CORRUPTED spec[0..1]: %.6g,%.6g -> %.6g,%.6g\n",
+                           st, (double)before0, (double)before1,
+                           (double)ref_spec[0], (double)ref_spec[1]);
+                }
+            }            fwrite(kws_debug_buf, sizeof(float), kws_debug_n, o);
             fclose(o);
         }
         for (int st = 1; st <= 9; st++) {
@@ -266,10 +297,17 @@ free(ref_spec);
             snprintf(out, sizeof(out), "%s/c_%d_%s.bin", sdir, st, names[st]);
             FILE *o = fopen(out, "wb");
             if (!o) { fprintf(stderr, "cannot write %s\n", out); break; }
-            kws_debug_stage = st;
-            (void)kws_model_run(ref_spec);
-            kws_debug_stage = 0;
-            fwrite(kws_debug_buf, sizeof(float), kws_debug_n, o);
+            {
+                float before0 = ref_spec[0], before1 = ref_spec[1];
+                kws_debug_stage = st;
+                (void)kws_model_run(ref_spec);
+                kws_debug_stage = 0;
+                if (ref_spec[0] != before0 || ref_spec[1] != before1) {
+                    printf("  stage %d CORRUPTED spec[0..1]: %.6g,%.6g -> %.6g,%.6g\n",
+                           st, (double)before0, (double)before1,
+                           (double)ref_spec[0], (double)ref_spec[1]);
+                }
+            }            fwrite(kws_debug_buf, sizeof(float), kws_debug_n, o);
             fclose(o);
             printf("stage %d %-8s %6zu floats -> %s\n", st, names[st],
                    kws_debug_n, out);

@@ -32,7 +32,7 @@ if not exist "main\model\reference" (
 )
 
 echo === building host test ===
-%GCC% -O2 -std=gnu11 -Wall -Wextra -Wno-unused-parameter ^
+%GCC% -O2 -std=gnu11 -DKWS_HOST_TEST -Wall -Wextra -Wno-unused-parameter ^
     -Imain -Imain\model ^
     main\kws_frontend.c main\kws_model.c tools\test_kws_host.c ^
     -o build_host_test.exe -lm

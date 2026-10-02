@@ -25,7 +25,13 @@
 
 #include "kws_frontend.h"
 
+#ifndef KWS_HOST_TEST
 #include <esp_attr.h>
+#endif
+/* On the host there is no PSRAM section; the buffers are ordinary .bss. */
+#ifndef EXT_RAM_BSS_ATTR
+#define EXT_RAM_BSS_ATTR
+#endif
 #include <math.h>
 #include <string.h>
 

@@ -36,7 +36,13 @@
 #include "kws_model.h"
 #include "kws_model_data.h"
 
+#ifndef KWS_HOST_TEST
 #include <esp_attr.h>
+#endif
+/* On the host there is no PSRAM section; the buffers are ordinary .bss. */
+#ifndef EXT_RAM_BSS_ATTR
+#define EXT_RAM_BSS_ATTR
+#endif
 #include <math.h>
 #include <string.h>
 
@@ -48,6 +54,10 @@
 #ifndef KWS_HOST_TEST
 extern const float kws_weights[];
 const float *kws_blob = kws_weights;
+#endif
+/* On the host there is no PSRAM section; the buffers are ordinary .bss. */
+#ifndef EXT_RAM_BSS_ATTR
+#define EXT_RAM_BSS_ATTR
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -103,6 +113,10 @@ static float    s_delta_dbg[KWS_FRAMES * 360];
     } while (0)
 #else
 #define KWS_CAPTURE(stage, src, count) do { } while (0)
+#endif
+/* On the host there is no PSRAM section; the buffers are ordinary .bss. */
+#ifndef EXT_RAM_BSS_ATTR
+#define EXT_RAM_BSS_ATTR
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -330,6 +344,10 @@ void kws_debug_build_feat(const float *spec, int t, float *out)
     memcpy(out, s_feat, sizeof(s_feat));
 }
 #endif
+/* On the host there is no PSRAM section; the buffers are ordinary .bss. */
+#ifndef EXT_RAM_BSS_ATTR
+#define EXT_RAM_BSS_ATTR
+#endif
 
 static void conv1_row(float *out);
 
@@ -349,6 +367,10 @@ void kws_debug_addrs(const char **names, const void **ptrs, int n)
     }
 }
 #endif
+/* On the host there is no PSRAM section; the buffers are ordinary .bss. */
+#ifndef EXT_RAM_BSS_ATTR
+#define EXT_RAM_BSS_ATTR
+#endif
 
 #ifdef KWS_HOST_TEST
 void kws_debug_conv1(const float *spec, int t, float *out)
@@ -356,6 +378,10 @@ void kws_debug_conv1(const float *spec, int t, float *out)
     build_feat(spec, t);
     conv1_row(out);
 }
+#endif
+/* On the host there is no PSRAM section; the buffers are ordinary .bss. */
+#ifndef EXT_RAM_BSS_ATTR
+#define EXT_RAM_BSS_ATTR
 #endif
 
 static void conv1_row(float *out)
@@ -625,9 +651,26 @@ float kws_model_run(const float *spec)
     gn_reset();
     for (int t = 0; t < KWS_FRAMES; t++) {
         build_feat(spec, t);
+#ifdef KWS_HOST_TEST
+        /* stage 20: s_feat at the exact call site, no accumulation in between */
+        if (t == 0) {
+            KWS_CAPTURE(20, s_feat, 360);
+            KWS_CAPTURE(22, spec, 8);   /* what spec[0..7] holds right here */
+        }
+        memcpy(&s_delta_dbg[(size_t)t * 360], s_feat, sizeof(s_feat));
+        /* stage 21: s_feat again, immediately after the memcpy */
+        KWS_CAPTURE(21, s_feat, 360);
+#endif
         conv1_row(s_row);
+#ifdef KWS_HOST_TEST
+        memcpy(&s_stem_dbg[(size_t)t * ROW_H], s_row, sizeof(s_row));
+#endif
         gn_accum(s_row, ROW_W, KWS_C1_OUT);
     }
+#ifdef KWS_HOST_TEST
+    KWS_CAPTURE(14, s_delta_dbg, KWS_FRAMES * 360);   /* delta stack */
+    KWS_CAPTURE(10, s_stem_dbg, KWS_FRAMES * ROW_H);  /* conv1 output */
+#endif
     gn_finalize(KWS_FRAMES * ROW_W * (KWS_C1_OUT / 4));
 
     /* --- pass 2: GroupNorm-2 statistics over f_conv output -------------- */
