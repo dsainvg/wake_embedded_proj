@@ -484,6 +484,16 @@ static void i2s_init(void)
     ESP_LOGI(TAG, "INMP441 on WS=%d SCK=%d SD=%d @ %d Hz, left slot",
              CONFIG_EXAMPLE_I2S_WS_GPIO, CONFIG_EXAMPLE_I2S_SCK_GPIO,
              CONFIG_EXAMPLE_I2S_SD_GPIO, SAMPLE_RATE);
+    /* The DMA ring is what decouples inference from capture: it fills
+     * continuously, so stalling in kws_model_run does not stall the mic.
+     * 16 x 1024 samples = 1.024 s of slack, far more than one inference, so
+     * blocking between hops does NOT lengthen the hop period. Samples are only
+     * lost if a single inference ever exceeds that budget, which the
+     * "inference longer than hop" warning below makes visible. */
+    ESP_LOGI(TAG, "I2S DMA ring: %d descs x %d frames = %d samples (%.3f s)",
+             chan_cfg.dma_desc_num, chan_cfg.dma_frame_num,
+             chan_cfg.dma_desc_num * chan_cfg.dma_frame_num,
+             (double)chan_cfg.dma_desc_num * chan_cfg.dma_frame_num / SAMPLE_RATE);
 }
 
 static void kws_task(void *arg)
@@ -548,6 +558,15 @@ static void kws_task(void *arg)
         /* Exponential average of inference time, so the reading is stable. */
         ema_us = (ema_us == 0) ? dt : (ema_us * 7 + dt) / 8;
         ema_inf_ms = (int32_t)(ema_us / 1000);
+
+        /* If one inference ever exceeds the hop, the DMA ring starts losing
+         * samples and the reported duty stops being the real duty. Say so
+         * rather than quietly degrading. */
+        if (dt > (int64_t)CONFIG_EXAMPLE_HOP_MS * 1000) {
+            ESP_LOGW(TAG, "inference took %d ms, longer than the %d ms hop - "
+                          "the DMA ring is now dropping audio",
+                     (int)(dt / 1000), CONFIG_EXAMPLE_HOP_MS);
+        }
 
         /* Peak-hold confirmation, exactly as models/kws_engine.py does it. An
          * EMA at alpha 0.6 cannot confirm a realistic burst: two frames at
