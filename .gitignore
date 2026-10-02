@@ -76,3 +76,20 @@ Desktop.ini
 *.workspace # General workspace files, can be from various tools
 *.suo       # Visual Studio Solution User Options
 *.sln.docstates # Visual Studio
+
+# Clangd / editor caches
+.cache/
+.clangd-index/
+
+# Recorded wake word clips pulled off the device by tools/pull_clips.ps1.
+# These are test output, not source: ~320 KB per clip and up to 25 slots, so they
+# would bloat every commit. Retrieve them with:
+#   .\tools\pull_clips.ps1 -Port COM15 -OutDir .\recorded
+recorded/
+clips/
+
+# NOTE: models/ is intentionally NOT ignored.
+# It is reserved for the wake_word_ml git submodule:
+#   https://github.com/dsainvg/wakeword_ml.git
+# Once added, git tracks it as a submodule (gitlink) and a gitignore rule for
+# the path would conflict with that.
