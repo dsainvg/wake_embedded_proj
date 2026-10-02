@@ -272,12 +272,28 @@ Validation-only buffers are behind `#ifdef KWS_HOST_TEST`. Together they are
 ~316 KB and must never exist in a firmware build — they overflowed internal
 DRAM before the `EXT_RAM_BSS_ATTR` change.
 
-**Known defect.** `build_feat` and `conv1_row` are each verified bit-exact in
-isolation, but calling them from inside `kws_model_run` yields a different
-result for the first four frames. Buffer overlap, compiler optimisation,
-input corruption and frame misalignment have all been ruled out. Host output is
-`P=0.0892` against a JAX reference of `0.0272` on a noise fixture. Until this
-is resolved the detector is not trustworthy.
+**Known defect.** Host output is `P=0.0892` against a JAX reference of
+`P=0.0272` on a noise fixture. The error is narrow and localised: `conv1` is
+bit-exact (7.6e-6, pure float32 rounding) for frames 4-48 and wrong only at
+**mel bin 0 of frames 0-3** — 2.15% RMS overall.
+
+What has been ruled out, each by direct test:
+
+- **The capture harness.** A capture-free build reproduces `P=0.08915997`
+  exactly, so the ~316 KB of validation buffers were not perturbing what they
+  measured.
+- **Undefined behaviour.** Identical output at `-O0`, `-O2` and
+  `-O2 -fno-strict-aliasing`.
+- **Buffer overlap.** All 14 static activation buffers dumped; none overlap.
+- **Input corruption.** The spec array is byte-identical to the `.npy` before
+  and after inference — 0 elements changed.
+- **Frame misalignment.** Cross-correlation of the two capture paths peaks
+  exactly at shift 0.
+
+The unresolved observation is that `spec[0..1]` read as garbage *inside* pass 1
+while being correct immediately before and after every call, with `spec[2..7]`
+correct throughout. That is unexplained, and it is the next thing to chase.
+Until it is resolved the detector is not trustworthy.
 
 ---
 
