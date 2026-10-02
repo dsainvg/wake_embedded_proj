@@ -688,7 +688,6 @@ float kws_model_run(const float *spec)
             KWS_CAPTURE(22, spec, 8);   /* what spec[0..7] holds right here */
             KWS_CAPTURE(23, (const float *)(const void *)&spec, 2);  /* the pointer itself */
         }
-        memcpy(&s_delta_dbg[(size_t)t * 360], s_feat, sizeof(s_feat));
         /* stage 21: s_feat again, immediately after the memcpy */
         KWS_CAPTURE(21, s_feat, 360);
 #endif

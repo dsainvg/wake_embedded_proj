@@ -161,9 +161,19 @@ int main(int argc, char **argv)
     }
 
     kws_blob = heap;
+    {
+        const char *nm[16]; const void *pt[16];
+        kws_debug_addrs(nm, pt, 16);
+        for (int i = 0; i < 14; i++) { printf("  %-14s %p\n", nm[i], pt[i]); }
+    }
     kws_frontend_init();
     kws_model_init();
     kws_blob = heap;
+    {
+        const char *nm[16]; const void *pt[16];
+        kws_debug_addrs(nm, pt, 16);
+        for (int i = 0; i < 14; i++) { printf("  %-14s %p\n", nm[i], pt[i]); }
+    }
     kws_frontend_init();
     kws_model_init();
 
