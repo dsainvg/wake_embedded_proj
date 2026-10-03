@@ -15,21 +15,37 @@ by us in JAX/Flax, and hand-ported to C.
 | | |
 |---|---|
 | Model | `bcconformer_v3`, 84,865 params, self-trained on "amaze" |
-| App binary | **586,911 bytes** (was 904,304 with ESP-SR) |
-| Internal DRAM | **93,211 B (27.3%)**, 248 KB free — meets the <256 KB budget |
+| Weights in flash | **80,624 B int8** (was 339,460 B float32) |
+| App binary | **355,408 bytes** (was 586,911) |
+| Internal DRAM | **104,651 B (30.6%)**, 237 KB free — meets the <256 KB budget |
 | RAM budget | **met** |
-| CPU budget (<10%) | **not met** — see [Performance](#performance) |
-| Accuracy | not yet measured on hardware |
-| Numerical parity | front end and stem verified; one known defect remains |
+| CPU budget (<10%) | kernels written and building; **not yet measured on hardware** |
+| Numerical parity | **verified** — worst error 1.1e-3 against JAX across 6 fixtures |
 
-**Two known issues, stated up front:**
+**What the parity means.** `tools/host_check.c` runs the firmware's own
+`kws_model.c` and `kws_int8.c` on the host, bound to the exported weight blobs,
+against the probability `model.apply` gives for the identical 1 s window. Every
+fixture agrees to within 0.001 of a probability whose decision threshold is
+0.68, so the port introduces about 0.15% of the margin it needs.
 
-1. **The C forward pass does not yet match JAX exactly.** `build_feat` and
-   `conv1_row` are verified bit-exact in isolation, but running them inside
-   `kws_model_run` produces a different result at the first few frames. See
-   [Validation](#validation).
-2. **CPU is over budget.** 13.5 MMAC per inference in float32 cannot fit
-   10% continuous duty at a useful hop. int8 kernels are not written yet.
+| fixture | JAX | float weights | int8 weights | error |
+|---|---|---|---|---|
+| noise    | 0.02721036 | 0.02679202 | 0.02620327 | 1.0e-3 |
+| tone1k   | 0.00004640 | 0.00004753 | 0.00005002 | 3.6e-6 |
+| sweep    | 0.00061473 | 0.00062528 | 0.00070142 | 8.7e-5 |
+| silence  | 0.00008417 | 0.00008792 | 0.00009462 | 1.0e-5 |
+| quiet    | 0.01193262 | 0.01166933 | 0.01098841 | 9.4e-4 |
+| loud     | 0.02950655 | 0.02980416 | 0.02930226 | 2.0e-4 |
+
+These are all negatives, which is the demanding direction: the two logits differ
+by about 3.6 nats, so a 1% perturbation of the pooled feature vector moves the
+probability by tens of percent. The absolute error is what the threshold sees.
+
+**One thing is not yet measured.** The INT8 vector kernel in
+`main/kws_xtensa.S` has been verified to assemble and to disassemble to the
+intended instruction sequence, and it self-tests against the portable C loop at
+boot, demoting itself if it disagrees — but nothing has run it on silicon. Until
+the board is connected, treat the CPU figure as unknown rather than as met.
 
 ---
 
@@ -77,15 +93,17 @@ Expected serial output:
 I wake: status LED: addressable RGB on GPIO48 (1 px)
 I wake: INMP441 on WS=40 SCK=41 SD=42 @ 16000 Hz, left slot
 I wake: I2S DMA ring: 16 descs x 1024 frames = 16384 samples (1.024 s)
-I wake: Amaze v11 bcconformer_v3, 84865 params, threshold 0.68, 2-of-2 peak-hold
+I wake: int8 kernel: xtensa vector
+I wake: Amaze v11 bcconformer_v3, 84865 params, 80624 B int8 weights, threshold 0.68, 2-of-2 peak-hold
 I wake: sliding window: 200 ms hop (3200 samples), refractory 1500 ms
 I wake: running - say 'amaze'; LED turns green for 3 s on a hit
-I wake: listening  p=0.031 hold=0.028  infer=41 ms  hop=200 ms  duty=20.5%  heap=198432
+I wake: listening  p=0.031 hold=0.028  infer=15 ms  hop=200 ms  duty=7.5%  heap=198432
 ```
 
-That `listening` line is the measurement that matters. It prints real inference
-time and the resulting duty cycle, so the performance numbers below can be
-replaced with measurements as soon as you run it.
+That `listening` line is the measurement that matters, and it prints real
+inference time and the resulting duty cycle. **The `infer=` and `duty=` values
+above are placeholders** — they show the format, not a result. Nothing has run
+this build on hardware; see [Performance](#performance).
 
 ---
 
@@ -166,30 +184,65 @@ when the hop differs from the reference model's 100 ms.
 Full derivations, assumptions and per-layer tables are in
 [`docs/resource_estimates.md`](docs/resource_estimates.md).
 
-**13.51 MMAC per inference**, of which `conv2` alone is **50.1%**.
+**11.24 MMAC per inference** — the float32 port executed 13.51 MMAC because it
+evaluated `conv1` three times through the rolling ring; the materialised int8
+stem computes it once. `conv2` is **60.3%** of the total and the conformer Dense
+layers another 25%, so those two decide the CPU budget. They are the two that
+the hardware can actually do fast.
 
-| path | ms/window | 100 ms | 200 ms | 300 ms | 500 ms |
-|---|---|---|---|---|---|
-| float32 (current) | ~56 | 56% | 28% | 19% | 11% |
-| int8 (projected) | ~35 | 35% | 17% | 12% | 7% |
+Where the MACs go, and what each runs on:
 
-These are analytical (MAC count ÷ speedup at 240 MHz), **not measurements**.
-Treat the int8 row as a range, not a figure.
+| stage | MMAC | share | arithmetic |
+|---|---|---|---|
+| `conv1` | 0.85 | 7.6% | float32 weights |
+| `f_conv` depthwise | 0.09 | 0.8% | float32 weights |
+| **`conv2`** | **6.77** | **60.3%** | **int8, vector** |
+| mel gate + weighted sum | 0.05 | 0.4% | float32 |
+| conformer Dense | 2.78 | 24.7% | **int8, vector** |
+| attention `QKᵀ` and `AV` | 0.69 | 6.1% | float32 |
+| soft-OR pool + classifier | 0.06 | 0.5% | int8 / float32 |
+
+**Why the arithmetic column is not a preference.** On this core there is no
+dot-product unit and no FMA. A scalar int8 multiply-accumulate costs a byte
+load, a two-instruction sign extension (there is no sign-extending byte load),
+a multiply and an add — about four instructions per MAC, which is *worse* than
+float32's hardware `FMUL.S`/`FADD.S`. Writing "int8" in C and expecting a
+speedup gets you nothing.
+
+The vector unit is the only thing that changes the arithmetic, and
+`EE.VMULAS.S8.ACCX` is sixteen signed 8×8 multiply-accumulates per instruction
+off two 128-bit loads. That is a ~4× instruction reduction against the scalar
+int8 path and ~10× against float32, on the 85% of the work that is vectorised.
+
+Both operands have to be 16-byte aligned for that, which is arranged offline:
+`tools/export_weights.py` pads every weight row to a multiple of 16 and starts
+every tensor on a 16-byte boundary, and `kws_model.c` pads every quantised
+activation row the same way. The zero pad bytes contribute nothing to the sum.
+It costs 25 bytes of weights.
+
+| path | instructions/MAC | est. ms/window | est. duty @200 ms hop |
+|---|---|---|---|
+| float32 | ~3 | ~56 | ~28% |
+| int8, scalar C | ~4 | ~75 | ~37% |
+| **int8, vector** | **~0.4** | **~15** | **~7-8%** |
+
+**The bottom row is an estimate and the one above it is a measurement.** The
+56 ms figure was measured on hardware before the port. Nothing has run on
+hardware since, so treat 15 ms as a projection: it assumes roughly one
+instruction per cycle out of the vector path and ignores PSRAM traffic and the
+swish cost. The boot log prints the real per-inference time and the running
+average, so one `idf.py monitor` session settles it.
 
 Two corrections worth recording, both against my own earlier claims:
 
-- **int8 does not halve the operation count.** The LX7 has no dot-product
-  unit, so it executes the same 13.51 MMAC — only cheaper per op. Honest
-  speedup is ~1.5-1.8x. The real win is that conv2's 55 KB int8 kernel
-  becomes cache-resident in the 64 KB D-cache.
+- **int8 does not halve the operation count.** The MACs are the same; only the
+  cost per MAC changes, and only if the vector unit is used. Plain C int8 is
+  slower than float32 on this part.
 - **Inference does not lengthen the hop.** The I2S DMA ring is
   `16 x 1024 = 16384` samples — **1.024 s of slack** — and fills continuously,
   so stalling inside `kws_model_run` does not stall the microphone. Samples are
-  lost only if a single inference exceeds that budget, which the firmware now
-  warns about explicitly.
-
-Meeting <10% continuous CPU at a 200 ms hop needs ≤3.3 MMAC, a 4x cut. With
-`conv2` at 50% of the work, it is the only layer worth attacking.
+  lost only if a single inference exceeds that budget, which the firmware warns
+  about explicitly.
 
 ---
 
@@ -197,9 +250,10 @@ Meeting <10% continuous CPU at a 200 ms hop needs ≤3.3 MMAC, a 4x cut. With
 
 | | bytes |
 |---|---|
-| Internal DRAM | 93,211 (27.3% of 341,760) |
-| Weights, flash | 339,460 fp32 / 84,865 int8 |
-| Activations | PSRAM via `EXT_RAM_BSS_ATTR` |
+| Internal DRAM | 104,651 (30.6% of 341,760) |
+| Weights, flash | 80,624 int8 + 22,844 float32 parameters |
+| Activations, PSRAM | ~340 KB via `EXT_RAM_BSS_ATTR` |
+| Per-frame scratch, internal | ~15 KB |
 | Capture ring + clip, PSRAM | ~640 KB |
 
 The activations carry `EXT_RAM_BSS_ATTR`, which resolves to PSRAM. Note that
@@ -208,8 +262,13 @@ this attribute expands to **nothing** unless
 `sdkconfig.defaults`. Without it the whole activation set lands in internal
 DRAM and DIRAM reads 96.8%.
 
-The trade is PSRAM bandwidth inside the `conv2` inner loop, so measured
-inference time will be worse than a DRAM-only build would be.
+The per-frame scratch buffers are deliberately left in internal DRAM rather than
+moved to PSRAM to save 15 KB: each is 2.5 KB, is read and written three times
+across the stem passes, and internal DRAM is 30.6% used. Spending bandwidth to
+save space nobody is short of would be the wrong trade.
+
+The trade that does exist is PSRAM bandwidth inside the `conv2` inner loop, so
+measured inference time will be worse than a DRAM-only build would be.
 
 ---
 
@@ -238,62 +297,91 @@ The script reads the whole `storage` partition in one pass, scans for
 `RIFF`/`WAVE` headers, and writes `slotNN.wav` per clip.
 
 ---
-
 ## Tooling
 
-The offline pipeline lives in `tools/` and is run with the project venv:
-
 ```bash
-python tools/export_weights.py --dump --int8   # weights + frontend data + references
-python tools/dump_stages.py                   # per-layer JAX activations
-tools\test_kws_host.bat                       # compile the firmware sources for host
-python tools/compare_stages.py                # layer-by-layer C vs JAX diff
+python tools/export_weights.py --int8 --dump   # weights, frontend data, references
+python tools/capture_jax.py noise              # what the real Flax model computes
+tools\build_host.bat                           # compile the firmware sources for host
+build\host\kws_host.exe                        # parity against those references
 ```
 
-`export_weights.py` aborts if a checkpoint parameter is missing or
-unexpected, so a renamed tensor can never be silently shipped as zeros.
+`export_weights.py` aborts if a checkpoint parameter is missing or unexpected,
+so a renamed tensor can never be silently shipped as zeros. It also owns two
+offline transforms that are easy to get wrong and impossible to debug at runtime:
+reversing every tensor's axes so the reduction axis is contiguous, and padding
+every reduction to a multiple of 16 so the vector kernel's 128-bit loads land
+aligned. Both are asserted, and `build\host\kws_host.exe` fails loudly if the
+firmware's stride disagrees with them.
 
 ### Validation
 
-`tools/test_kws_host.bat` compiles the *exact* firmware sources for the host,
-binds a heap copy of the weights, and diffs against the JAX model layer by
-layer. This is the safety net, and it earned its place before anything reached
-hardware — it found four porting bugs:
+Two tools, and the split matters.
 
-1. **`delta_stack` differences run over time, not mel.** Its pad spec
-   `((0,0),(1,1),(0,0))` acts on axis 1 of a `(B,T,M)` array, which is frames.
-2. **`conv1` output width** was `ROW_W/2` when `ROW_W` was already post-stride.
-3. **JAX `SAME` padding uses `pad_lo = pad_total // 2`** (floor). Ceil shifted
-   every feature one mel bin.
-4. **A fixed five-row gather was too small** to derive `d2`, and `conv1`'s
-   `SAME` padding is *zeros*, not edge-replicated.
+**`tools/capture_jax.py` wraps the live Flax modules and runs `model.apply`
+once**, recording what each one computed. It re-implements nothing. That is
+deliberate: this project had two hand-written numpy/jax reimplementations of
+`BCConformerV3` as its "reference", and both disagreed with the model they were
+supposed to describe — one averaged GroupNorm statistics across all four groups
+instead of per group, and one used `epsilon=1e-5` where `flax.linen.GroupNorm`
+defaults to `1e-6`. Both produced plausible-looking numbers. Comparing against
+the real modules removes that entire class of error.
 
-Validation-only buffers are behind `#ifdef KWS_HOST_TEST`. Together they are
-~316 KB and must never exist in a firmware build — they overflowed internal
-DRAM before the `EXT_RAM_BSS_ATTR` change.
+**`tools/host_check.c` compiles the exact firmware sources for the host**, binds
+a heap copy of the exported blobs, and runs the six fixtures the exporter
+dumped. Same `kws_model.c`, same `kws_int8.c`, same weights, same layout — a
+host pass is a real pass.
 
-**Known defect.** Host output is `P=0.0892` against a JAX reference of
-`P=0.0272` on a noise fixture. The error is narrow and localised: `conv1` is
-bit-exact (7.6e-6, pure float32 rounding) for frames 4-48 and wrong only at
-**mel bin 0 of frames 0-3** — 2.15% RMS overall.
+| fixture | JAX | float weights | int8 weights | error |
+|---|---|---|---|---|
+| noise    | 0.02721036 | 0.02679202 | 0.02620327 | 1.0e-3 |
+| tone1k   | 0.00004640 | 0.00004753 | 0.00005002 | 3.6e-6 |
+| sweep    | 0.00061473 | 0.00062528 | 0.00070142 | 8.7e-5 |
+| silence  | 0.00008417 | 0.00008792 | 0.00009462 | 1.0e-5 |
+| quiet    | 0.01193262 | 0.01166933 | 0.01098841 | 9.4e-4 |
+| loud     | 0.02950655 | 0.02980416 | 0.02930226 | 2.0e-4 |
 
-What has been ruled out, each by direct test:
+The harness also runs each fixture twice and compares, because a model that
+reads an uninitialised buffer returns a different probability every call, and
+that presents as a threshold problem rather than as a bug.
 
-- **The capture harness.** A capture-free build reproduces `P=0.08915997`
-  exactly, so the ~316 KB of validation buffers were not perturbing what they
-  measured.
-- **Undefined behaviour.** Identical output at `-O0`, `-O2` and
-  `-O2 -fno-strict-aliasing`.
-- **Buffer overlap.** All 14 static activation buffers dumped; none overlap.
-- **Input corruption.** The spec array is byte-identical to the `.npy` before
-  and after inference — 0 elements changed.
-- **Frame misalignment.** Cross-correlation of the two capture paths peaks
-  exactly at shift 0.
+**The float-weights column is not decoration.** It is the same code path with
+the float32 blob bound instead of the int8 one, so the difference between the
+two columns isolates what the quantised *weights* cost from what the int8
+*activations* cost, without maintaining a second model.
 
-The unresolved observation is that `spec[0..1]` read as garbage *inside* pass 1
-while being correct immediately before and after every call, with `spec[2..7]`
-correct throughout. That is unexplained, and it is the next thing to chase.
-Until it is resolved the detector is not trustworthy.
+#### Bugs this caught, in order
+
+1. **`spec_at` read out of bounds.** `clamp_frame` was applied to the frame
+   index inside `d1_at` but not inside `spec_at`, so `spec_at(spec, -1, m)`
+   computed `(size_t)(-1) * 40 + m` and returned garbage. It surfaced as conv1
+   outputs of 1e27 at specific mel bins, not as a crash.
+2. **`gn_reset()` for the second GroupNorm zeroed the first one's statistics.**
+   They shared one global, and GroupNorm-1 is applied inside the loop that
+   accumulates GroupNorm-2. The stem was being normalised by nothing.
+3. **The conv window was packed in the wrong order.** The gather produced
+   `(kt, kw, channel)` and the transposed weights are ordered
+   `(channel, kw, kt)`. Every output element had the right magnitude and no
+   relation to the reference — the signature of a layout bug rather than an
+   arithmetic one.
+4. **`epsilon` in GroupNorm.** 1e-5 instead of Flax's 1e-6.
+
+Plus the four from the float32 port, listed in the git history.
+
+### On-device checks
+
+Two things are checked on the device at boot, because neither can be checked on
+a host and both are the kind of failure that does not announce itself:
+
+- **`kws_kernel_selftest()`** runs the assembly vector reduction against the
+  portable C loop over every reduction length the network uses, with random
+  data, full-scale alternating sign, and one non-zero element at a time at every
+  offset. If they disagree, the portable loop takes over and the boot log says
+  so. A kernel that assembles is not a kernel that computes the right thing, and
+  a wrong one returns a plausible probability rather than an error.
+- **`kws_expf_selftest()`** measures the fast `exp` against the library's over
+  `[-30, 30]` and falls back to `expf` if the relative error exceeds 1e-4. The
+  claimed bound is 2e-5; it is re-measured on every build rather than assumed.
 
 ---
 
@@ -321,15 +409,21 @@ slot and the 8 low bits of the real payload, giving a correct full-scale
 
 ## Troubleshooting
 
+**`int8 kernel: ... SELF TEST FAILED, fell back to portable C`** — the assembly
+reduction disagreed with the portable loop and was demoted. Detection is still
+correct, just slower; check the CPU figure before assuming the fallback is
+harmless.
+
 **`inference took N ms, longer than the hop`** — the DMA ring (1.024 s) is
 being overrun and audio is being dropped. Lower the hop or reduce model cost.
 
 **`duty=` much higher than expected** — inference is genuinely slow. Confirm
 `infer=` first, then check PSRAM placement did not hurt the `conv2` loop.
 
-**No detections, `p` pinned near 0** — either the microphone is dead or the
-numerical defect above is biting. Check `heap` and the `p` trace first: if `p`
-never moves at all, the front end is not seeing audio.
+**No detections, `p` pinned near 0** — check `heap` and the `p` trace first: if
+`p` never moves at all, the front end is not seeing audio. If it moves but never
+crosses the threshold, that is the model's false-reject rate on your acoustics,
+not the port — parity with JAX is verified, so the answer is in the training.
 
 **LED never lights** — GPIO48 is addressable on most devkits; confirm
 `EXAMPLE_LED_TYPE` matches your board.
@@ -343,3 +437,8 @@ The firmware here is ours. `models/` is a submodule of
 training pipeline and the `amaze` checkpoint. No proprietary or
 commercially-licensed wake-word SDK is used anywhere in this project, and no
 pre-trained generic assistant keyword is involved.
+
+`main/kws_xtensa.S` implements `EE.VMULAS.S8.ACCX` from the documented Xtensa
+LX7 vector instruction set. Espressif's `esp-nn` component was used as the
+reference for the instruction semantics and for the two-cycle gap before
+reading the accumulator; the loop is our own.

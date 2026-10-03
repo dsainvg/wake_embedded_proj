@@ -22,6 +22,7 @@
 #include "esp_log.h"
 #include "esp_partition.h"
 #include "esp_system.h"
+#include "esp_task_wdt.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -32,6 +33,7 @@
 #include "nvs_flash.h"
 
 #include "kws_frontend.h"
+#include "kws_int8.h"
 #include "kws_model.h"
 
 #if CONFIG_EXAMPLE_LED_TYPE_WS2812
@@ -42,6 +44,13 @@
 static const char *TAG = "wake";
 
 #define SAMPLE_RATE          CONFIG_EXAMPLE_SAMPLE_RATE
+/* I2S DMA ring depth, in milliseconds. This -- not the hop -- is the budget an
+ * inference has to fit inside: the read blocks until the hop's samples have
+ * arrived, so the ring only ever holds the time spent in kws_model_run. Sized in
+ * i2s_init from the same numbers the driver is given. */
+#define RING_DESC_NUM        16
+#define RING_FRAME_NUM       1024
+#define RING_SLACK_MS        ((RING_DESC_NUM * RING_FRAME_NUM * 1000) / SAMPLE_RATE)
 #define CLIP_SECONDS         CONFIG_EXAMPLE_CLIP_SECONDS
 #define CLIP_SAMPLES         (SAMPLE_RATE * CLIP_SECONDS)
 #define PRE_ROLL_SAMPLES     (SAMPLE_RATE * CONFIG_EXAMPLE_PRE_ROLL_SECONDS)
@@ -453,8 +462,8 @@ static void storage_task(void *arg)
 static void i2s_init(void)
 {
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    chan_cfg.dma_desc_num = 16;
-    chan_cfg.dma_frame_num = 1024;
+    chan_cfg.dma_desc_num = RING_DESC_NUM;
+    chan_cfg.dma_frame_num = RING_FRAME_NUM;
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, NULL, &s_rx_chan));
 
     /*
@@ -531,7 +540,25 @@ static void kws_task(void *arg)
     int64_t ema_us = 0;
     int32_t ema_inf_ms = 0;
 
+    /*
+     * Subscribe this task to the task watchdog and reset it in the loop.
+     *
+     * Without this the task is watched only indirectly, through IDLE0: the
+     * watchdog is reset by idle tasks, so a task that never blocks starves them
+     * and trips the watchdog even though nothing has hung. That is exactly what
+     * happens here -- while the DMA ring stays full the read at the top of the
+     * loop returns immediately, the task never yields, and IDLE0 does not run.
+     *
+     * Subscribing the task that is actually doing the work states the real
+     * requirement, which is "an inference must not take longer than the
+     * watchdog period", and stops the watchdog from being a proxy for whether
+     * the scheduler got a turn.
+     */
+    esp_task_wdt_add(NULL);
+    ESP_LOGI(TAG, "kws task subscribed to the task watchdog");
+
     for (;;) {
+        esp_task_wdt_reset();
         size_t got = 0;
         while (got < (size_t)hop * sizeof(int16_t)) {
             size_t n = 0;
@@ -546,6 +573,13 @@ static void kws_task(void *arg)
             got += n;
         }
 
+        #if CONFIG_EXAMPLE_PRE_ROLL_SECONDS > 0
+        ring_push(raw, (size_t)hop);
+#endif
+#if CONFIG_EXAMPLE_STORAGE_ENABLED
+        capture_push(raw, (size_t)hop);
+#endif
+
         kws_frontend_push(raw, hop);
         if (!kws_frontend_compute(spec)) {
             continue;               /* still filling the first window */
@@ -554,18 +588,30 @@ static void kws_task(void *arg)
         const int64_t t0 = esp_timer_get_time();
         const float prob = kws_model_run(spec);
         const int64_t dt = esp_timer_get_time() - t0;
+        /* An inference this long is the thing the watchdog is watching for, so
+         * reset after it as well as before the read. */
+        esp_task_wdt_reset();
 
         /* Exponential average of inference time, so the reading is stable. */
         ema_us = (ema_us == 0) ? dt : (ema_us * 7 + dt) / 8;
         ema_inf_ms = (int32_t)(ema_us / 1000);
 
-        /* If one inference ever exceeds the hop, the DMA ring starts losing
-         * samples and the reported duty stops being the real duty. Say so
-         * rather than quietly degrading. */
-        if (dt > (int64_t)CONFIG_EXAMPLE_HOP_MS * 1000) {
+        /* Samples are only lost if a single inference outruns the DMA ring, not
+         * the hop. The read blocks until the hop's samples have arrived, so the
+         * hop period is hop + inference and the ring level is one inference
+         * deep. Comparing against the hop reports a stall as a data loss, which
+         * is both wrong and alarming: at 315 ms against a 200 ms hop nothing is
+         * dropped, the wall-clock period is just 515 ms. The number that costs
+         * audio is the ring. */
+        if (dt > (int64_t)RING_SLACK_MS * 1000) {
+            ESP_LOGW(TAG, "inference took %d ms, longer than the %d ms DMA ring "
+                          "-- audio is being dropped",
+                     (int)(dt / 1000), RING_SLACK_MS);
+        } else if (dt > (int64_t)CONFIG_EXAMPLE_HOP_MS * 1000) {
             ESP_LOGW(TAG, "inference took %d ms, longer than the %d ms hop - "
-                          "the DMA ring is now dropping audio",
-                     (int)(dt / 1000), CONFIG_EXAMPLE_HOP_MS);
+                          "period is now ~%d ms (no samples lost, ring is %d ms)",
+                     (int)(dt / 1000), CONFIG_EXAMPLE_HOP_MS,
+                     (int)(dt / 1000) + CONFIG_EXAMPLE_HOP_MS, RING_SLACK_MS);
         }
 
         /* Peak-hold confirmation, exactly as models/kws_engine.py does it. An
@@ -611,6 +657,25 @@ static void kws_task(void *arg)
                      CONFIG_EXAMPLE_HOP_MS,
                      100.0f * (float)ema_inf_ms / (float)CONFIG_EXAMPLE_HOP_MS,
                      (unsigned)esp_get_free_heap_size());
+
+            /* Where the inference time goes, averaged over the runs since the
+             * last line. An inference that overruns the hop has to be attacked
+             * where the time actually is, and the stage names are the argument
+             * for which stage that is. */
+            const uint64_t runs = kws_model_stage_runs();
+            if (runs > 0) {
+                uint64_t total = 0;
+                for (int s = 0; s < KWS_STAGE_COUNT; s++) {
+                    total += kws_model_stage_us(s);
+                }
+                for (int s = 0; s < KWS_STAGE_COUNT; s++) {
+                    const uint64_t us = kws_model_stage_us(s);
+                    ESP_LOGI(TAG, "    %-10s %6.1f ms  %4.1f%%",
+                             kws_model_stage_name(s), (double)us / 1000.0,
+                             100.0 * (double)us / (double)(total ? total : 1));
+                }
+                kws_model_stage_reset();
+            }
             next_stat = now + 5000000;
         }
     }
@@ -648,9 +713,54 @@ void app_main(void)
     kws_frontend_init();
     kws_model_init();
 
-    ESP_LOGI(TAG, "Amaze v11 bcconformer_v3, %u params, threshold %.2f, "
-                  "%d-of-%d peak-hold, decay %.2f",
-             KWS_PARAM_COUNT, (double)CONFIG_EXAMPLE_THRESHOLD,
+    /*
+     * Verify the INT8 vector reduction against the portable one before arming
+     * the detector.
+     *
+     * The assembly kernel in kws_xtensa.S is the difference between meeting the
+     * CPU budget and missing it by a factor of four, and a kernel that computes
+     * the wrong sum does not announce itself: it returns a plausible probability,
+     * and the symptom is a wake word that never fires. A kernel that assembles is
+     * not a kernel that computes the right thing, so the answer is checked here,
+     * once, over every reduction length the network uses -- and the portable
+     * loop takes over automatically if it disagrees.
+     */
+    const int kernel_ok = kws_kernel_selftest();
+    ESP_LOGI(TAG, "int8 kernel: %s%s", kws_kernel_using_xtensa() ? "xtensa vector"
+                                                                 : "portable C",
+             kernel_ok ? "" : " -- SELF TEST FAILED, fell back to portable C");
+
+    /*
+     * conv2's windowed reduction is demoted on its own evidence, so it gets its
+     * own line. If this says portable while the line above says xtensa vector,
+     * conv2 is running the scalar loop and the inference will be slow for a
+     * reason that has nothing to do with the model.
+     */
+    ESP_LOGI(TAG, "conv2 window reduction: %s",
+             kws_kernel_taps_using_xtensa() ? "xtensa vector"
+                                            : "portable C -- SELFTEST FAILED");
+
+    /*
+     * The two transcendental replacements, reported with the error each one
+     * measured. A fallback that engages silently is indistinguishable from a
+     * build that was always this slow, so the verdict belongs in the boot log
+     * next to the kernel's: if infer= comes back high, "exp: fell back" is the
+     * first thing to check.
+     */
+    ESP_LOGI(TAG, "fast exp: %s (worst rel %.2e, tol 1e-4)",
+             kws_expf_worst_relerr() < 1e-4f ? "in use" : "FELL BACK to expf",
+             (double)kws_expf_worst_relerr());
+    ESP_LOGI(TAG, "fast rcp: %s (worst rel %.2e, tol 1e-6)",
+             kws_rcp_worst_relerr() < 1e-6f ? "in use" : "FELL BACK to divide",
+             (double)kws_rcp_worst_relerr());
+    ESP_LOGI(TAG, "fast rsqrt: %s (worst rel %.2e, tol 1e-6)",
+             kws_rsqrt_worst_relerr() < 1e-6f ? "in use" : "FELL BACK to sqrtf",
+             (double)kws_rsqrt_worst_relerr());
+
+    ESP_LOGI(TAG, "Amaze v11 bcconformer_v3, %u params, %u B int8 weights, "
+                  "threshold %.2f, %d-of-%d peak-hold, decay %.2f",
+             KWS_PARAM_COUNT, (unsigned)KWS_I8_BYTES,
+             (double)CONFIG_EXAMPLE_THRESHOLD,
              CONFIG_EXAMPLE_NEED, CONFIG_EXAMPLE_NEED,
              (double)CONFIG_EXAMPLE_HOLD_DECAY);
 

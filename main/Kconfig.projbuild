@@ -119,9 +119,9 @@ endmenu
 menu "Flash Clip Storage"
 
     config EXAMPLE_STORAGE_ENABLED
-        bool "Store wake word clips to internal flash"
-        default y
-        help
+    bool "Store wake word clips to internal flash"
+    default y
+    help
             Keep a rolling 10-second PCM buffer in PSRAM and write it to the
             "storage" partition as a WAV file each time the wake word is detected.
 
