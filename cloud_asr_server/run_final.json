@@ -1,0 +1,78 @@
+{
+  "config": {
+    "hop_ms": 200,
+    "infer_ms": 334,
+    "ring_slack_ms": 1024,
+    "preroll_ms": 1000,
+    "threshold": null,
+    "arch": "bcconformer_v3"
+  },
+  "audio": {
+    "source": "edge-tts",
+    "voice": "en-US-AriaNeural",
+    "text": "Amaze",
+    "keyword_start_sample": 24000,
+    "keyword_end_sample": 34049,
+    "keyword_seconds": 0.6281
+  },
+  "device": {
+    "keyword_end": 285507.8538716,
+    "detect": 285509.59980909975,
+    "cloud_first_audio": NaN,
+    "first_byte_write": 285509.6132959,
+    "cloud_wake_event": null,
+    "offset": 0.0,
+    "uncertainty": 0.0,
+    "theta_spread": 0.0,
+    "probe_samples": 0,
+    "keyword_end_sample": 34049,
+    "stream_start_sample": 27456,
+    "preroll_samples": 16000,
+    "samples_dropped": 21120,
+    "warnings": [],
+    "edge_detect_ms": 1745.937,
+    "detect_write_ms": 13.487,
+    "network_ms": NaN,
+    "metadata_ms": null,
+    "total_ms": NaN,
+    "uncertainty_ms": 0.0,
+    "problems": [
+      "21120 samples were dropped by the device: the stream has a discontinuity and its audio timeline is not the room's",
+      "no clock probe completed: edge and cloud clocks were never related, so total_ms is not a measurement"
+    ]
+  },
+  "cloud": {
+    "keyword_end": 285507.8538716,
+    "detect": 285509.59980909975,
+    "cloud_first_audio": 1404.9858224391937,
+    "first_byte_write": 285509.6132959,
+    "cloud_wake_event": 1404.9795219898224,
+    "offset": -284104.6313597134,
+    "uncertainty": 0.0003366685996297747,
+    "theta_spread": 0.0002121124416589737,
+    "probe_samples": 15,
+    "keyword_end_sample": 34049,
+    "stream_start_sample": 27456,
+    "preroll_samples": 16000,
+    "samples_dropped": 8256,
+    "warnings": [],
+    "edge_detect_ms": 1745.937,
+    "detect_write_ms": 13.487,
+    "network_ms": 3.886,
+    "metadata_ms": 6.3,
+    "total_ms": 1763.311,
+    "uncertainty_ms": 0.337,
+    "problems": [
+      "8256 samples were dropped by the device: the stream has a discontinuity and its audio timeline is not the room's"
+    ]
+  },
+  "sustain": {
+    "samples_consumed": 74049,
+    "samples_mic_delivered": 88704,
+    "samples_read": 54400,
+    "samples_dropped": 21120,
+    "max_read_lag_ms": 1158.0,
+    "first_drop_hop": 8,
+    "sustain_factor": 0.6133
+  }
+}

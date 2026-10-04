@@ -1,63 +1,52 @@
-# The weight blobs are turned into C arrays at build time by tools/bin2c.py
-# rather than embedded with CMake's target_add_binary_data. A blob placed into
-# .rodata by the assembler has no guaranteed alignment, and the Xtensa LX7 traps
-# on an unaligned load instead of silently coping. A C array lets the compiler
-# place it with explicit alignment, which the INT8 vector reduction in
-# main/kws_xtensa.S needs: it loads 128 bits at a time, so both the blob and
-# every 16-byte row inside it have to be aligned.
-#
-# Two arrays come out:
-#   kws_weights.c   the int8 weight blob, ~79 KB
-#   kws_params.c    5,711 float32 values -- the normalisation gains and biases,
-#                   the attention position bias, and the stem convolutions,
-#                   which stay in float32 on purpose. See FLOAT_TENSORS in
-#                   tools/export_weights.py for why those are not quantised.
-#
-# The files only change when the model does, so they are generated at CONFIGURE
-# time rather than as build rules: an add_custom_command(OUTPUT ...) is "not
-# scriptable" in an IDF component scope because no target exists yet when IDF
-# runs its scriptable-configure pass. A timestamp stamp file guards the work.
-set(KWS_BIN    ${CMAKE_CURRENT_LIST_DIR}/model/kws_model_i8.bin)
+# The bcconformer_v3 blob is gone: kws_model.c is deleted and m1_g_wide
+# replaces it. Its bin2c step, the weight target and the stamp went with it.
+
 set(KWS_BIN2C  ${CMAKE_CURRENT_LIST_DIR}/../tools/bin2c.py)
-set(KWS_WSRC   ${CMAKE_CURRENT_BINARY_DIR}/kws_weights.c)
-set(KWS_PSRC   ${CMAKE_CURRENT_BINARY_DIR}/kws_params.c)
-set(KWS_STAMP  ${CMAKE_CURRENT_BINARY_DIR}/kws_weights.stamp)
+set(KWS_M1GW_BIN    ${CMAKE_CURRENT_LIST_DIR}/model/kws_m1gw_i8.bin)
+set(KWS_M1GW_SCBIN  ${CMAKE_CURRENT_LIST_DIR}/model/kws_m1gw_scales.bin)
+set(KWS_M1GW_WSRC   ${CMAKE_CURRENT_BINARY_DIR}/kws_m1gw_blob.c)
+set(KWS_M1GW_SCSRC  ${CMAKE_CURRENT_BINARY_DIR}/kws_m1gw_scales_gen.c)
+set(KWS_M1GW_STAMP  ${CMAKE_CURRENT_BINARY_DIR}/kws_m1gw.stamp)
 
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-             ${KWS_BIN} ${KWS_BIN2C})
-
-file(TIMESTAMP ${KWS_BIN} KWS_BIN_MTIME "%Y%m%d%H%M%S")
-set(KWS_NEED_GEN TRUE)
-if(EXISTS ${KWS_STAMP})
-    file(READ ${KWS_STAMP} KWS_STAMPED)
-    if(KWS_STAMPED STREQUAL KWS_BIN_MTIME AND EXISTS ${KWS_WSRC} AND EXISTS ${KWS_PSRC})
-        set(KWS_NEED_GEN FALSE)
+# --- m1_g_wide: int8 weights + per-channel dequant scales -------------------
+file(TIMESTAMP ${KWS_M1GW_BIN} KWS_M1GW_MTIME "%Y%m%d%H%M%S")
+file(TIMESTAMP ${KWS_M1GW_SCBIN} KWS_M1GW_SCMTIME "%Y%m%d%H%M%S")
+set(KWS_M1GW_NEED_GEN TRUE)
+if(EXISTS ${KWS_M1GW_STAMP})
+    file(READ ${KWS_M1GW_STAMP} KWS_M1GW_STAMPED)
+    if(KWS_M1GW_STAMPED STREQUAL KWS_M1GW_MTIME${KWS_M1GW_SCMTIME}
+       AND EXISTS ${KWS_M1GW_WSRC} AND EXISTS ${KWS_M1GW_SCSRC})
+        set(KWS_M1GW_NEED_GEN FALSE)
     endif()
 endif()
 
-if(KWS_NEED_GEN)
+if(KWS_M1GW_NEED_GEN)
     execute_process(
-        COMMAND ${PYTHON} ${KWS_BIN2C} ${KWS_BIN} ${KWS_WSRC} kws_weights_i8 --int8
-        RESULT_VARIABLE KWS_RC
-        OUTPUT_VARIABLE KWS_OUT
-        ERROR_VARIABLE  KWS_ERR)
-    if(NOT KWS_RC EQUAL 0)
-        message(FATAL_ERROR "bin2c failed (${KWS_RC}): ${KWS_ERR}")
+        COMMAND ${PYTHON} ${KWS_BIN2C} ${KWS_M1GW_BIN} ${KWS_M1GW_WSRC} kws_m1gw_blob_data --int8
+        RESULT_VARIABLE KWS_M1GW_RC OUTPUT_VARIABLE KWS_M1GW_OUT ERROR_VARIABLE KWS_M1GW_ERR)
+    if(NOT KWS_M1GW_RC EQUAL 0)
+        message(FATAL_ERROR "bin2c failed on the m1_g_wide blob (${KWS_M1GW_RC}): ${KWS_M1GW_ERR}")
     endif()
-    message(STATUS "${KWS_OUT}")
-
-    # The float parameters are emitted by the same exporter, as values inside
-    # main/model/kws_model_data.h, so there is no second blob to convert here.
-    file(WRITE ${KWS_STAMP} ${KWS_BIN_MTIME})
+    execute_process(
+        COMMAND ${PYTHON} ${KWS_BIN2C} ${KWS_M1GW_SCBIN} ${KWS_M1GW_SCSRC} kws_m1gw_scales_data
+        RESULT_VARIABLE KWS_M1GW_RC2 OUTPUT_VARIABLE KWS_M1GW_OUT2 ERROR_VARIABLE KWS_M1GW_ERR2)
+    if(NOT KWS_M1GW_RC2 EQUAL 0)
+        message(FATAL_ERROR "bin2c failed on the m1_g_wide scales (${KWS_M1GW_RC2}): ${KWS_M1GW_ERR2}")
+    endif()
+    message(STATUS "${KWS_M1GW_OUT}${KWS_M1GW_OUT2}")
+    file(WRITE ${KWS_M1GW_STAMP} ${KWS_M1GW_MTIME}${KWS_M1GW_SCMTIME})
 endif()
 
 idf_component_register(
     SRCS "wake_word_main.c"
          "kws_frontend.c"
-         "kws_model.c"
+         "kws_fastmath.c"
          "kws_int8.c"
          "kws_xtensa.S"
-         "${KWS_WSRC}"
+         "kws_m1gw.c"
+         "model/kws_m1gw_data.c"
+         "${KWS_M1GW_WSRC}"
+         "${KWS_M1GW_SCSRC}"
     INCLUDE_DIRS "." "model"
     REQUIRES
         esp_driver_i2s

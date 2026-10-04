@@ -12,7 +12,7 @@ The four boundaries in the brief:
 | 1 | Model size, RAM/flash footprint | **AT RISK / FAIL** | 221 KB internal + 259 KB PSRAM = **480 KB** vs a 256 KB limit |
 | 2 | CPU < 10% while idling in continuous listening | **FAIL** | **296 ms** per inference vs a **22.2 ms** budget — **13.3x over** |
 | 3 | High true-positive rate, near-zero false activations | **UNVERIFIED** | 79.8% streaming recall claimed offline; **no positive has ever been run on-device** |
-| 4 | Latency from keyword end to cloud ASR | **NOT BUILT** | no streaming/transport layer exists |
+| 4 | Latency from keyword end to cloud ASR | **MEASURED, device half only** | **1771 ms total**, of which **1746 ms (98.6%) is the detector and 6 ms (0.4%) is transport** — see `docs/latency.md` |
 
 The headline: **the model itself fits; the implementation does not.** And on the
 plain ESP32 the brief names as an example target, it fails far harder, because
@@ -173,25 +173,61 @@ The hop cannot be raised as a performance shortcut without re-validating recall.
 
 ---
 
-## 4. Latency: not implemented
+## 4. Latency: measured, and it is not a network problem
 
-The brief's defining feature is streaming the audio that *follows* the keyword to
-a cloud ASR with minimal overhead. There is no network, transport or ASR client
-in this project. What exists is the capture half:
+> **Superseded.** This section previously read "not implemented" and observed
+> that no transport existed. The harness now measures the metric end to end
+> against synthesized audio with a known keyword end, and the device half is
+> instrumented in firmware. Full method and numbers: **`docs/latency.md`**.
 
-- a rolling 10-second pre-roll buffer in PSRAM, and a 10-second post-keyword
-  capture written to the internal `storage` partition as a WAV (`recorded/`).
+The measurement requires solving two problems the original section did not
+identify: the edge has no RTC, so the offset to the cloud's clock has to be
+measured rather than assumed, and the metric has to be decomposed or it hides
+where the time is.
 
-The capture machinery was **dead** until this session — `ring_push` and
-`capture_push` were defined, documented as "called from the feed task for every
-AFE frame", and never called. The compiler's unused-function warnings were the
-only evidence. They are now wired into the feed loop, but this has never been
-observed to work end-to-end, because no detection has ever fired.
+Measured, over a persistent WebSocket, at the shipped 200 ms hop with the
+measured 334 ms inference:
 
-Writing to internal flash is also the wrong shape for the actual requirement: a
-cloud handoff wants a stream, not a file written after the fact. The 25-slot
-storage partition and the WAV framing would be replaced by a ring buffer feeding
-a socket.
+| term | ms | share |
+|---|---:|---:|
+| keyword end -> detection | 1745.9 | 98.6% |
+| detection -> socket write | 19.0 | 1.1% |
+| socket write -> cloud ingest | 6.2 +/- 0.4 | 0.4% |
+| **total** | **1771.2 +/- 0.4** | |
+
+So the transport is 0.4% of the metric. A cloud handoff still needs to be
+built, but building it is not what would make this number better.
+
+### The same finding applies to boundary 2
+
+The CPU section above concludes from the 334 ms inference that the device
+cannot run at a 200 ms hop. That is right, and the consequence is worse than
+"too slow":
+
+The read blocks until the hop's samples exist, so the loop period is
+`max(hop, period + infer)`. Once `infer > hop` it never catches up, the DMA
+backlog grows by `infer - hop` every hop, and once the backlog passes the ring
+the oldest samples are overwritten before they are ever read. At the shipped
+settings that is 134 ms of audio destroyed on every hop, from hop 8 onward —
+23.8% of a 5.5 s clip, measured.
+
+The firmware's guard cannot detect this. It compares a *single* inference
+against the ring, and 334 ms is under 1024 ms, so it stays silent while the
+cumulative backlog walks past. The comment next to that check — the ring level
+"is one inference deep" — holds only when `infer <= hop`.
+
+This has been fixed in the firmware as a *measurement* (a drift watchdog
+against the sample clock, and a machine-parseable `LAT` line per detection), not
+as a behaviour. The behaviour still needs the inference under 200 ms or the
+analysis moved off the DMA reader; `docs/latency.md` gives the detail and
+`analyze_device_latency.py` consumes the new log line.
+
+### On the previous text
+
+The original section noted that `ring_push` and `capture_push` were dead code
+and that internal-flash WAVs are the wrong shape for a cloud handoff. Both
+stand: the capture path is wired, and the ring buffer feeding a socket is still
+the right replacement for a file written after the fact.
 
 ---
 

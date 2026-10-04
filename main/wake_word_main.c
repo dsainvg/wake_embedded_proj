@@ -34,7 +34,9 @@
 
 #include "kws_frontend.h"
 #include "kws_int8.h"
-#include "kws_model.h"
+#include "kws_fastmath.h"
+#include "kws_m1gw.h"
+#include "kws_m1gw_data.h"
 
 #if CONFIG_EXAMPLE_LED_TYPE_WS2812
 #include "led_strip.h"
@@ -46,7 +48,7 @@ static const char *TAG = "wake";
 #define SAMPLE_RATE          CONFIG_EXAMPLE_SAMPLE_RATE
 /* I2S DMA ring depth, in milliseconds. This -- not the hop -- is the budget an
  * inference has to fit inside: the read blocks until the hop's samples have
- * arrived, so the ring only ever holds the time spent in kws_model_run. Sized in
+ * arrived, so the ring only ever holds the time spent in kws_m1gw_run. Sized in
  * i2s_init from the same numbers the driver is given. */
 #define RING_DESC_NUM        16
 #define RING_FRAME_NUM       1024
@@ -65,6 +67,19 @@ static const char *TAG = "wake";
 
 static i2s_chan_handle_t s_rx_chan = NULL;
 
+/*
+ * Monotonic count of every sample the DMA has handed to this task.
+ *
+ * This is the device's only trustworthy timebase for a latency measurement: it
+ * is derived from the same reads the analysis consumes, so it survives a reboot
+ * of the scheduler, a change of the hop, or a network stack that buffers, none
+ * of which a wall clock would. Absolute device time comes from esp_timer, which
+ * the capture path already stamps; this counter ties that time to a sample
+ * index, and sample index to sample index is what makes the numbers comparable
+ * to anything measured off the audio.
+ */
+static volatile int64_t s_sample_clock = 0;   /* samples delivered to kws_task */
+
 /* Short pre-roll ring, used only to seed a clip with the tail of the keyword. */
 static int16_t *s_ring = NULL;
 static size_t s_ring_wpos = 0;
@@ -75,6 +90,7 @@ static SemaphoreHandle_t s_ring_lock = NULL;
 static int16_t *s_clip = NULL;
 static size_t s_capture_len = 0;          /* valid samples in s_clip   */
 static volatile bool s_capture_active = false;
+static volatile int64_t s_capture_start_sample = 0;
 static SemaphoreHandle_t s_capture_lock = NULL;
 static SemaphoreHandle_t s_write_req = NULL;   /* given when a clip is full */
 
@@ -266,8 +282,14 @@ static size_t ring_peek_recent(int16_t *dst, size_t want)
  * Called on an accepted detection. Seeds the clip with the tail of the keyword
  * so the saved audio actually contains it, then opens the window for the audio
  * that follows.
+ *
+ * The sample index the clip starts at is recorded, because it is the only way
+ * to relate what was captured to when the verdict was reached. Without it the
+ * saved WAV has no position in the device's audio timeline, and the offset
+ * between "the keyword ended" and "the clip begins" -- which is where the
+ * latency actually is -- cannot be recovered from the file after the fact.
  */
-static void capture_start(void)
+static void capture_start(int64_t detected_at_sample)
 {
     xSemaphoreTake(s_capture_lock, portMAX_DELAY);
 
@@ -282,6 +304,7 @@ static void capture_start(void)
 #else
     s_capture_len = 0;
 #endif
+    s_capture_start_sample = detected_at_sample - (int64_t)s_capture_len;
     s_capture_active = true;
 
     xSemaphoreGive(s_capture_lock);
@@ -494,7 +517,7 @@ static void i2s_init(void)
              CONFIG_EXAMPLE_I2S_WS_GPIO, CONFIG_EXAMPLE_I2S_SCK_GPIO,
              CONFIG_EXAMPLE_I2S_SD_GPIO, SAMPLE_RATE);
     /* The DMA ring is what decouples inference from capture: it fills
-     * continuously, so stalling in kws_model_run does not stall the mic.
+     * continuously, so stalling in kws_m1gw_run does not stall the mic.
      * 16 x 1024 samples = 1.024 s of slack, far more than one inference, so
      * blocking between hops does NOT lengthen the hop period. Samples are only
      * lost if a single inference ever exceeds that budget, which the
@@ -536,7 +559,17 @@ static void kws_task(void *arg)
     int hits = 0;
     int lockout = 0;
 
+    /* Anchors for the latency record. The keyword's acoustic end is not
+     * observable here -- it is somewhere inside the 1 s window, and the window
+     * is 1 s long -- so what this logs is the interval it must lie in, and the
+     * host analyzer narrows that against the saved audio. Reporting a single
+     * "keyword ended at" number would mean inventing one. */
+    int64_t win_end_sample = 0;
+    int64_t first_hit_end = -1;
+
     int64_t next_stat = esp_timer_get_time();
+    int64_t t_loop_start = 0;
+    int64_t samples_at_start = 0;
     int64_t ema_us = 0;
     int32_t ema_inf_ms = 0;
 
@@ -559,18 +592,54 @@ static void kws_task(void *arg)
 
     for (;;) {
         esp_task_wdt_reset();
+        const size_t want = (size_t)hop * sizeof(int16_t);
         size_t got = 0;
-        while (got < (size_t)hop * sizeof(int16_t)) {
+        while (got < want) {
             size_t n = 0;
             esp_err_t err = i2s_channel_read(s_rx_chan, (uint8_t *)raw + got,
-                                             (size_t)hop * sizeof(int16_t) - got,
-                                             &n, portMAX_DELAY);
+                                             want - got, &n, portMAX_DELAY);
             if (err != ESP_OK) {
-                ESP_LOGW(TAG, "i2s read: %s", esp_err_to_name(err));
+                ESP_LOGW(TAG, "i2s read: %s (after %u of %u bytes)",
+                         esp_err_to_name(err), (unsigned)got, (unsigned)want);
                 vTaskDelay(pdMS_TO_TICKS(10));
                 break;
             }
+            if (n == 0) {
+                /* No data and no error. Yield rather than spin, so the idle
+                 * task still gets the core -- the task watchdog subscribes
+                 * IDLE0 on this part, and a spin here starves it. */
+                taskYIELD();
+                continue;
+            }
             got += n;
+        }
+
+        /*
+         * Advance the clock by what was ACTUALLY read, not by a nominal hop.
+         *
+         * This was `s_sample_clock += hop`, unconditionally. Combined with the
+         * `break` above it meant a short or failed read still counted a whole
+         * hop, so the sample clock ran ahead of the wall clock: drift went
+         * negative and kept going (-278 -> -7106 ms over 25 s), which is the
+         * signature of the analysis being fed time-compressed audio rather than
+         * the microphone. It also made the drift watchdog report the opposite of
+         * what was happening, since a genuine overrun would have pushed it
+         * positive.
+         *
+         * Only whole hops are analysed: a partial read would leave the front end
+         * mid-hop, which its 20 ms feature alignment rejects anyway.
+         */
+        const size_t have = got / sizeof(int16_t);
+        s_sample_clock += (int64_t)have;
+        win_end_sample = s_sample_clock;
+        if (t_loop_start == 0) {
+            t_loop_start = esp_timer_get_time();
+            samples_at_start = s_sample_clock;
+        }
+
+        if (have != (size_t)hop) {
+            /* Counted honestly above; nothing to analyse this iteration. */
+            continue;
         }
 
         #if CONFIG_EXAMPLE_PRE_ROLL_SECONDS > 0
@@ -586,7 +655,7 @@ static void kws_task(void *arg)
         }
 
         const int64_t t0 = esp_timer_get_time();
-        const float prob = kws_model_run(spec);
+        const float prob = kws_m1gw_run(spec);
         const int64_t dt = esp_timer_get_time() - t0;
         /* An inference this long is the thing the watchdog is watching for, so
          * reset after it as well as before the read. */
@@ -596,13 +665,18 @@ static void kws_task(void *arg)
         ema_us = (ema_us == 0) ? dt : (ema_us * 7 + dt) / 8;
         ema_inf_ms = (int32_t)(ema_us / 1000);
 
-        /* Samples are only lost if a single inference outruns the DMA ring, not
-         * the hop. The read blocks until the hop's samples have arrived, so the
-         * hop period is hop + inference and the ring level is one inference
-         * deep. Comparing against the hop reports a stall as a data loss, which
-         * is both wrong and alarming: at 315 ms against a 200 ms hop nothing is
-         * dropped, the wall-clock period is just 515 ms. The number that costs
-         * audio is the ring. */
+        /* A single long inference is not what costs audio. The read blocks until the
+         * hop's samples exist, so the recurrence is
+         *
+         *     period(k) = max(hop, period(k-1)) + infer
+         *
+         * and when infer > hop it never catches up: every iteration falls
+         * further behind real time and the DMA ring's backlog grows by
+         * (infer - hop) per hop until the ring is full, after which the oldest
+         * samples are overwritten before they are ever read. The per-inference
+         * warning below cannot see that -- 334 ms against a 1024 ms ring is
+         * under the threshold -- so the running drift is measured against the
+         * sample clock instead, which is the quantity that actually goes wrong. */
         if (dt > (int64_t)RING_SLACK_MS * 1000) {
             ESP_LOGW(TAG, "inference took %d ms, longer than the %d ms DMA ring "
                           "-- audio is being dropped",
@@ -639,42 +713,149 @@ static void kws_task(void *arg)
             hits = 0;
         }
 
+        /* First window over threshold, whether or not it confirmed. This is the
+         * tightest on-device bound available on where the keyword ended. */
+        if (hold >= CONFIG_EXAMPLE_THRESHOLD && first_hit_end < 0) {
+            first_hit_end = win_end_sample;
+        }
+
         if (detected) {
+            const int64_t t_detect_us = esp_timer_get_time();
+
             ESP_LOGW(TAG, "WAKE WORD 'amaze'  p=%.3f  (%d ms inference)",
                      (double)prob, ema_inf_ms);
+
             s_led_state = LED_DETECTED;
-            s_led_until = esp_timer_get_time() + 3000000;
+            s_led_until = t_detect_us + 3000000;
 #if CONFIG_EXAMPLE_STORAGE_ENABLED
-            capture_start();
+            capture_start(win_end_sample);
 #endif
+
+            /*
+             * The latency record, on one machine-parseable line, logged after
+             * capture_start so `clip_start` is this turn's and not the last one.
+             *
+             * `kw_end_lo`/`kw_end_hi` bracket where the keyword ended. The
+             * first above-threshold window is the earliest instant the model had
+             * seen the whole keyword, so it cannot end later than that window's
+             * trailing edge; and no earlier window scored, so it cannot end
+             * before the earliest of them. The interval is a full second wide,
+             * which is why the host analyzer resolves it acoustically from the
+             * saved WAV instead of the device pretending to know.
+             *
+             * `clip_start_sample` is where the saved WAV's first sample sits in
+             * the device timeline, which is what ties that analysis to this
+             * detection.
+             */
+            ESP_LOGW(TAG, "LAT t_us=%" PRId64 " sample=%" PRId64
+                          " kw_end_lo=%" PRId64 " kw_end_hi=%" PRId64
+                          " clip_start=%" PRId64 " infer_us=%" PRId64
+                          " drift_us=%" PRId64,
+                     t_detect_us, win_end_sample,
+                     (first_hit_end >= 0 ? first_hit_end : win_end_sample) - KWS_AUDIO_SAMPLES,
+                     win_end_sample, s_capture_start_sample, dt,
+                     (t_detect_us - t_loop_start)
+                         - (int64_t)((double)(win_end_sample - samples_at_start)
+                                     * 1000000.0 / SAMPLE_RATE));
+
+            first_hit_end = -1;
         }
 
         const int64_t now = esp_timer_get_time();
         if (now >= next_stat) {
+            /* Drift is the measurement the per-inference warning cannot make:
+             * how far the samples the task has consumed have fallen behind the
+             * wall clock. Zero means the device is keeping up with the room.
+             * Once it exceeds the DMA ring, audio is being lost silently and
+             * every downstream number -- including any latency figure taken from
+             * this log -- describes a timeline with holes in it. */
+            const int64_t drift_us = (now - t_loop_start)
+                - (int64_t)((double)(s_sample_clock - samples_at_start)
+                            * 1000000.0 / SAMPLE_RATE);
+
             ESP_LOGI(TAG, "listening  p=%.3f hold=%.3f  infer=%d ms  hop=%d ms  "
-                          "duty=%.1f%%  heap=%u",
+                          "duty=%.1f%%  drift=%" PRId64 " ms  heap=%u",
                      (double)prob, (double)hold, ema_inf_ms,
                      CONFIG_EXAMPLE_HOP_MS,
                      100.0f * (float)ema_inf_ms / (float)CONFIG_EXAMPLE_HOP_MS,
+                     drift_us / 1000,
                      (unsigned)esp_get_free_heap_size());
+
+            if (drift_us > (int64_t)RING_SLACK_MS * 1000) {
+                ESP_LOGW(TAG, "sample clock is %" PRId64 " ms behind the wall "
+                              "clock, past the %d ms DMA ring -- audio is being "
+                              "dropped. Inference (%" PRId64 " ms) exceeds the "
+                              "%d ms hop, so the task never catches up.",
+                         drift_us / 1000, RING_SLACK_MS, dt / 1000,
+                         CONFIG_EXAMPLE_HOP_MS);
+            }
 
             /* Where the inference time goes, averaged over the runs since the
              * last line. An inference that overruns the hop has to be attacked
              * where the time actually is, and the stage names are the argument
              * for which stage that is. */
-            const uint64_t runs = kws_model_stage_runs();
+            const uint64_t runs = kws_m1gw_stage_runs();
             if (runs > 0) {
-                uint64_t total = 0;
-                for (int s = 0; s < KWS_STAGE_COUNT; s++) {
-                    total += kws_model_stage_us(s);
+                uint64_t total_us = 0, total_cyc = 0;
+                for (int s = 0; s < KWS_M1GW_STAGE_COUNT; s++) {
+                    total_us += kws_m1gw_stage_us(s);
+                    total_cyc += kws_m1gw_stage_cycles(s);
                 }
-                for (int s = 0; s < KWS_STAGE_COUNT; s++) {
-                    const uint64_t us = kws_model_stage_us(s);
-                    ESP_LOGI(TAG, "    %-10s %6.1f ms  %4.1f%%",
-                             kws_model_stage_name(s), (double)us / 1000.0,
-                             100.0 * (double)us / (double)(total ? total : 1));
+                const double ms = (double)total_us / 1000.0 / (double)runs;
+                const double duty = 100.0 * (double)total_us
+                        / ((double)runs * (double)CONFIG_EXAMPLE_HOP_MS * 1000.0);
+
+                ESP_LOGI(TAG, "  ---- resource summary over %llu inference(s) ----",
+                         (unsigned long long)runs);
+                ESP_LOGI(TAG, "  cpu      %8.2f ms/infer  %5.1f%% of a %d ms hop  "
+                              "last %u us  peak %u us",
+                         ms, duty, CONFIG_EXAMPLE_HOP_MS,
+                         (unsigned)kws_m1gw_last_us(),
+                         (unsigned)kws_m1gw_peak_us());
+                ESP_LOGI(TAG, "  cycles   %8llu total  %.2f M/infer  (measured rate %llu Hz)",
+                         (unsigned long long)total_cyc,
+                         (double)total_cyc / (double)runs / 1e6,
+                         (unsigned long long)kws_m1gw_cpu_hz());
+                ESP_LOGI(TAG, "  work     %8u MAC/infer  %.3f MAC/us  floor %.3f ms "
+                              "@ 16 MAC/instr",
+                         (unsigned)kws_m1gw_total_mac(),
+                         ms > 0.0 ? (double)kws_m1gw_total_mac() / (double)total_us : 0.0,
+                         (double)kws_m1gw_total_mac() / 3.84e6);
+                ESP_LOGI(TAG, "  ram      %8u B arena (%.1f%% of 256 KB)  free heap %u B",
+                         (unsigned)kws_m1gw_ram_bytes(),
+                         100.0 * kws_m1gw_ram_bytes() / (256.0 * 1024.0),
+                         (unsigned)esp_get_free_heap_size());
+
+                ESP_LOGI(TAG, "    %-10s %8s %8s %9s %7s",
+                         "stage", "ms", "MAC", "cyc/MAC", "share");
+                for (int s = 0; s < KWS_M1GW_STAGE_COUNT; s++) {
+                    const uint64_t us = kws_m1gw_stage_us(s);
+                    const uint64_t cyc = kws_m1gw_stage_cycles(s);
+                    const uint32_t mac = kws_m1gw_stage_mac(s);
+                    /* cycles per MAC is the diagnostic ratio: a stage spending
+                     * far more than its neighbours is an implementation problem
+                     * (misaligned reduction, fallback path), not a model one. */
+                    char ratio[16] = "-";
+                    if (mac > 0) {
+                        snprintf(ratio, sizeof(ratio), "%.2f",
+                                 (double)cyc / (double)mac / (double)runs);
+                    }
+                    ESP_LOGI(TAG, "    %-10s %8.2f %8u %9s %6.1f%%",
+                             kws_m1gw_stage_name(s),
+                             (double)us / 1000.0 / (double)runs,
+                             (unsigned)mac, ratio,
+                             100.0 * (double)us / (double)(total_us ? total_us : 1));
                 }
-                kws_model_stage_reset();
+                ESP_LOGI(TAG, "    projection breakdown (per inference):");
+                for (int s = 0; s < KWS_M1GW_PROJ_COUNT; s++) {
+                    ESP_LOGI(TAG, "      %-8s %8.3f ms %12llu cyc",
+                             kws_m1gw_proj_name(s),
+                             (double)kws_m1gw_proj_us(s) / 1000.0 / (double)runs,
+                             (unsigned long long)(kws_m1gw_proj_cycles(s)
+                                 / (unsigned long long)runs));
+                }
+                kws_m1gw_proj_reset();
+                kws_m1gw_stage_reset();
             }
             next_stat = now + 5000000;
         }
@@ -711,7 +892,6 @@ void app_main(void)
 #endif
 
     kws_frontend_init();
-    kws_model_init();
 
     /*
      * Verify the INT8 vector reduction against the portable one before arming
@@ -726,6 +906,19 @@ void app_main(void)
      * loop takes over automatically if it disagrees.
      */
     const int kernel_ok = kws_kernel_selftest();
+    /* The fast transcendentals are only enabled once they have been measured
+     * against libm, and this is where that happens. m1_g_wide makes roughly
+     * 29,000 of these calls per inference; at libm's ~1000 cycles each they were
+     * most of a 225 ms inference, and the multiply-accumulates they drowned out
+     * were under a millisecond of the budget. */
+    const int fast_ok = kws_fastmath_selftest();
+    ESP_LOGI(TAG, "fast exp: %s (worst rel %.2e, tol 1e-4)",
+             fast_ok ? "in use" : "FELL BACK to expf",
+             (double)kws_expf_worst_relerr());
+    ESP_LOGI(TAG, "fast rcp: %s (worst rel %.2e, tol 1e-5)  [no __divsf3 per activation]",
+             kws_rcp_worst_relerr() < 1.0e-5f ? "in use" : "FELL BACK to divide",
+             (double)kws_rcp_worst_relerr());
+
     ESP_LOGI(TAG, "int8 kernel: %s%s", kws_kernel_using_xtensa() ? "xtensa vector"
                                                                  : "portable C",
              kernel_ok ? "" : " -- SELF TEST FAILED, fell back to portable C");
@@ -747,20 +940,14 @@ void app_main(void)
      * next to the kernel's: if infer= comes back high, "exp: fell back" is the
      * first thing to check.
      */
-    ESP_LOGI(TAG, "fast exp: %s (worst rel %.2e, tol 1e-4)",
-             kws_expf_worst_relerr() < 1e-4f ? "in use" : "FELL BACK to expf",
-             (double)kws_expf_worst_relerr());
-    ESP_LOGI(TAG, "fast rcp: %s (worst rel %.2e, tol 1e-6)",
-             kws_rcp_worst_relerr() < 1e-6f ? "in use" : "FELL BACK to divide",
-             (double)kws_rcp_worst_relerr());
-    ESP_LOGI(TAG, "fast rsqrt: %s (worst rel %.2e, tol 1e-6)",
-             kws_rsqrt_worst_relerr() < 1e-6f ? "in use" : "FELL BACK to sqrtf",
-             (double)kws_rsqrt_worst_relerr());
-
-    ESP_LOGI(TAG, "Amaze v11 bcconformer_v3, %u params, %u B int8 weights, "
-                  "threshold %.2f, %d-of-%d peak-hold, decay %.2f",
-             KWS_PARAM_COUNT, (unsigned)KWS_I8_BYTES,
-             (double)CONFIG_EXAMPLE_THRESHOLD,
+    /* The fast exp/rcp/rsqrt probes lived in kws_model.c and went with it. m1_g_wide
+     * has no hand-rolled fast path for them, so there is nothing to report here;
+     * the kernel self-test above is still the gate on arithmetic. */
+    ESP_LOGI(TAG, "Amaze m1_g_wide, %u params, %u B int8 weights, "
+                  "threshold %.6f, %d-of-%d peak-hold, decay %.2f",
+             (unsigned)KWS_M1GW_PARAM_COUNT,
+             (unsigned)kws_m1gw_ram_bytes(),
+             (double)kws_m1gw_threshold(),
              CONFIG_EXAMPLE_NEED, CONFIG_EXAMPLE_NEED,
              (double)CONFIG_EXAMPLE_HOLD_DECAY);
 

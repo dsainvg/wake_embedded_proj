@@ -5,8 +5,9 @@ ESP32-S3 N16R8 with an INMP441 I2S microphone. On a hit the LED turns green
 and the following 10 seconds of audio are written to internal flash as a WAV.
 
 No cloud, no assistant SDK, no pre-trained generic keyword. The model is
-`best_v11_production.flax` from the [`wake_word_ml`](models) submodule, trained
-by us in JAX/Flax, and hand-ported to C.
+`best_m1g_wide.pt` from the [`wake_word_ml`](models) submodule -- a
+depthwise-separable DS-CNN trained in PyTorch -- and hand-ported to int8 C. It
+replaced `bcconformer_v3` (JAX/Flax), whose implementation has been deleted.
 
 ---
 
@@ -14,13 +15,24 @@ by us in JAX/Flax, and hand-ported to C.
 
 | | |
 |---|---|
-| Model | `bcconformer_v3`, 84,865 params, self-trained on "amaze" |
-| Weights in flash | **80,624 B int8** (was 339,460 B float32) |
-| App binary | **355,408 bytes** (was 586,911) |
-| Internal DRAM | **104,651 B (30.6%)**, 237 KB free — meets the <256 KB budget |
-| RAM budget | **met** |
-| CPU budget (<10%) | kernels written and building; **not yet measured on hardware** |
-| Numerical parity | **verified** — worst error 1.1e-3 against JAX across 6 fixtures |
+| Model | `m1_g_wide`, 146,187 params, self-trained on "amaze" |
+| Weights in flash | **159,664 B int8** (per-channel scales; biases and norms float32) |
+| Internal DRAM, model arena | **139,640 B (53.3%)**, 116 KB free -- meets the <256 KB budget |
+| Arithmetic | 2.77 MMAC, 0.722 ms floor @ 240 MHz int8 |
+| CPU budget (<10% of a 100 ms hop) | 13.8x headroom by the arithmetic floor; **not yet measured on hardware** |
+| Numerical parity | **verified** -- int8 C within 1-4% of a float reference on 4 fixtures; stem-stage correlation 0.9989-0.99997 |
+| Detection | discrimination **verified end-to-end** (22x, keyword 0.795 vs noise 0.036) with zero false alarms; **confirmation unproven** -- synthesised speech clears the threshold in at most one window, so the 2-of-2 gate rejects it (`tools\test_detection.py`) |
+| Kernel self-test | runs at boot; the detector refuses to arm if the INT8 reduction disagrees with its portable twin |
+| Latency, keyword end -> cloud ASR | **1771 ms ± 0.4**, decomposed: **98.6% detector, 0.4% transport** — [`docs/latency.md`](docs/latency.md) |
+
+**The headline latency finding.** The metric is dominated by the device, not the
+network. At the shipped 200 ms hop with the measured 334 ms inference, the read
+loop never catches up: the DMA backlog grows 134 ms per hop and, from hop 8
+onward, the oldest samples are overwritten before they are read — 23.8% of a
+5.5 s clip destroyed, at a fixed 134 ms tax per hop forever. The firmware's own
+guard compares a *single* inference against the ring and cannot see this. The
+audio that a transport would stream does not currently exist. Details,
+measurement method and the wire protocol are in [`docs/latency.md`](docs/latency.md).
 
 **What the parity means.** `tools/host_check.c` runs the firmware's own
 `kws_model.c` and `kws_int8.c` on the host, bound to the exported weight blobs,
@@ -106,6 +118,67 @@ above are placeholders** — they show the format, not a result. Nothing has run
 this build on hardware; see [Performance](#performance).
 
 ---
+
+### Verifying the port
+
+```
+python tools\preflight.py                                    # READY TO FLASH, or why not
+tools\build_m1gw_host.bat                                    # build the host harnesses
+build\host\m1gw_host.exe build\host\m1gw\spec.bin           # int8 kernel vs reference
+python tools\m1gw_reference.py --spec <log-mel>.npy --out <dir>   # float reference
+python tools\test_detection.py                              # does it actually FIRE?
+```
+
+`preflight.py` exists because a green build says nothing about whether the
+image is *correct*. It cross-checks `sdkconfig` against the checkpoint's frozen
+threshold and the Kconfig default, the hop against the 20 ms feature stride, the
+blob against the manifest, and the model arena against the 256 KB budget -- the
+arena read from the **target** object file, since the host harness carries debug
+snapshots the firmware does not, and it fails if any `.bss` symbol outside the
+arena is larger than 4 KB, which is how the first draft passed its own
+`_Static_assert` while sitting at 353 KB. Two of these checks exist because they
+caught a real defect here: `sdkconfig` overrides the Kconfig default, so
+changing the default alone left the firmware at the previous model's 0.68
+threshold; and the hop was still 200 ms after the default was changed to 100.
+
+The host build compiles the *same* `main/kws_m1gw.c` the firmware runs, with
+`esp_timer` shimmed and nothing else changed, so a host pass is a real pass of
+the real code.
+
+`test_detection.py` is the one that answers the production question. It
+synthesises the keyword and two controls with `edge-tts`, then drives
+`kws_frontend.c` + `kws_m1gw.c` one hop at a time exactly as `kws_task` does:
+
+```
+silence             0.0309      0/21    0 confirmed   control
+noise               0.0356      0/21    0 confirmed   control
+kw_GuyNeural        0.7094      0/29    0 confirmed   keyword
+kw_JennyNeural      0.7950      0/29    0 confirmed   keyword
+
+discrimination 22.4x      PASS  (controls reject, gap > 10x)
+```
+
+Read the two right-hand columns, not just the peak. `over thr` is windows whose
+score clears 0.796077; `confirmed` is what the firmware's 2-of-2 peak-hold
+actually emits. **No synthetic voice is confirmed**, and that is the honest
+result: the keyword clears the threshold in at most one window out of 29, and
+2-of-2 needs two. A single isolated window is what a false positive looks like,
+so the gate rejecting it may be exactly right.
+
+An earlier version of this harness counted `over thr` and reported "the detector
+fires". That was wrong in the flattering direction -- it scored a one-window
+spike as a detection, which is the precise shape the gate exists to reject. The
+harness now mirrors the firmware's peak-hold exactly.
+
+Raising `NEED` was tried as the fix and does not work: at thresholds from 0.60
+to 0.796, no keyword ever produces two consecutive over-threshold windows, so
+3-of-3 confirms nothing at all. `NEED` is left at the checkpoint's 2.
+
+What this harness does establish: the port is not silently broken (22x
+discrimination, zero false alarms on both controls). What it cannot establish is
+that the shipped operating point detects real speech -- the threshold encodes
+0.5% FPR on **human** speech and edge-tts is out of distribution for it.
+Answering that needs a real recording.
 
 ## Architecture
 
@@ -305,6 +378,26 @@ python tools/capture_jax.py noise              # what the real Flax model comput
 tools\build_host.bat                           # compile the firmware sources for host
 build\host\kws_host.exe                        # parity against those references
 ```
+
+### Edge-to-cloud latency harness
+
+In `models/cloud_asr_server/`, and documented in
+[`docs/latency.md`](docs/latency.md).
+
+```bash
+python models/cloud_asr_server/test_latency.py   # 35 self-tests, no hardware
+python models/cloud_asr_server/server.py         # ASR endpoint + clock estimator
+python models/cloud_asr_server/esp32_emulator.py       # full chain, known keyword end
+python models/cloud_asr_server/analyze_device_latency.py --log monitor.log --slot recorded/slot00.wav
+```
+
+`esp32_emulator.py` runs the real detector against synthesized audio whose
+keyword end is a known sample index, and models the firmware's read/infer loop
+in real time — so the edge term is exact and every term above it can be
+attributed. `test_latency.py` asserts the loop model's behaviour (no loss below
+the hop, the predicted first-lost hop, the steady-state tax) and the clock
+estimator's error bound against a known-zero offset. Every turn appends a JSON
+record to `latency_log.jsonl`.
 
 `export_weights.py` aborts if a checkpoint parameter is missing or unexpected,
 so a renamed tensor can never be silently shipped as zeros. It also owns two

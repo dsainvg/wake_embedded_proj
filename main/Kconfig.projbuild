@@ -42,18 +42,35 @@ menu "Wake Word Detection"
     config EXAMPLE_THRESHOLD
         float "Detection threshold"
         range 0.0 1.0
-        default 0.68
+        default 0.796077
         help
-            Frozen operating point read from models/best_v11_production.flax
-            (deploy_threshold). Raising it trades recall for fewer false
+            Frozen operating point read from models/best_m1g_wide.pt
+            (0.796076774597168 at 0.5% FPR). Raising it trades recall for fewer false
             activations; lowering it does the reverse.
 
     config EXAMPLE_NEED
         int "Consecutive hits required to confirm"
+        range 1 8
         default 2
         help
-            deploy_need from the checkpoint. 2-of-2 beats 1-of-2 on false
-            alarms; 1-of-2 gains 16-20 points of recall at low SNR but 16 FA/h.
+            Consecutive above-threshold hops required before a detection
+            fires. Confirmation time is NEED x hop, so this is the latency /
+            false-alarm lever; the hop itself is a CPU and cadence choice.
+            At the shipped 200 ms hop and NEED=2 that is 400 ms.
+
+            deploy_need from the checkpoint, and 78.73% TPR at 0.5% FPR was
+            MEASURED at 2. Do not raise it: the keyword clears the threshold in
+            at most ONE window out of 29 on synthesised speech, so 2-of-2
+            already rejects it and 3-of-3 rejects everything -- measured, at
+            thresholds from 0.60 to 0.796.
+
+            A single isolated window is what a false positive looks like, which
+            is the whole reason this gate exists. If detections are being
+            missed, the threshold is the knob, not NEED -- but note the
+            threshold encodes 0.5% FPR on real human speech, so lowering it
+            trades away a measured false-alarm rate.
+
+            1-of-2 gains 16-20 points of recall at low SNR but costs 16 FA/h.
 
     config EXAMPLE_HOLD_DECAY
         float "Peak-hold decay per window"
@@ -72,15 +89,24 @@ menu "Wake Word Detection"
 
     config EXAMPLE_HOP_MS
         int "Inference hop (ms)"
+        range 20 1000
         default 200
         help
-            How far the 1 s window advances per inference. This is the main CPU
-            dial: duty cycle is roughly inference_time / hop.
+            How far the 1.6 s window advances per inference. This is the main CPU
+            dial and it is now a BUDGET question, not a choice: an inference
+            that overruns the hop drops audio continuously, because the task can
+            never catch up.
 
-            200 ms costs about 9.4% CPU with INT8 weights, about 28% in float32.
-            Must be a multiple of 20 ms, because the front end only reuses
-            feature frames when the hop is a whole number of feature hops
-            (320 samples).
+            Measured on this model at 200 ms inference: 100 ms hop meant 239%
+            duty and the sample clock fell behind without bound (drift 18.7 s
+            after 30 s of running, 23.8% of the audio destroyed). 200 ms puts
+            inference inside the hop, which is the first configuration in which
+            the device actually keeps up with the room.
+
+            The cost is confirmation latency: NEED consecutive hops are needed
+            before a detection fires, so at NEED=2 this is 400 ms rather than
+            200 ms. That is the trade, and it is the right one -- a detector
+            that hears everything is worth less than one that hears the room.
 
     choice EXAMPLE_LED_TYPE
         prompt "Status LED type"
